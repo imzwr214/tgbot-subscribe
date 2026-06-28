@@ -81,7 +81,7 @@ interface ShortSubscription {
 }
 
 interface TelegramMessageEntity {
-  type: "code";
+  type: "blockquote" | "code" | "url";
   offset: number;
   length: number;
 }
@@ -365,7 +365,7 @@ async function fetchAndParseSubscription(url: string, env: Env): Promise<ParsedS
         userInfo: parseSubscriptionUserInfo(response.headers.get("subscription-userinfo")),
         nodes: parsed.nodes,
         sourceType: parsed.sourceType,
-        airportName: detectAirportName(url, raw)
+        airportName: detectAirportName(url, raw, response.headers, response.url)
       };
       const score = scoreSubscriptionResult(result);
       if (score > bestScore) {
@@ -684,7 +684,7 @@ function formatSubscriptionMessage(result: ParsedSubscription, subUrl: string): 
   const message = createFormattedText();
 
   appendLine(message, "📊 订阅查询结果");
-  appendLine(message, `📋 机场名称: ${result.airportName}`);
+  appendAirportNameLine(message, result.airportName);
   appendLine(message, `📦 格式: ${result.sourceType}`);
   appendLine(message, "🔗 订阅链接:");
   appendCodeLine(message, subUrl);
@@ -692,7 +692,7 @@ function formatSubscriptionMessage(result: ParsedSubscription, subUrl: string): 
 
   if (result.userInfo) {
     const used = result.userInfo.upload + result.userInfo.download;
-    appendTextBlock(message, [
+    appendBlockQuote(message, [
       `📈 已用/总量: ${formatBytes(used)} / ${formatBytes(result.userInfo.total)}`,
       `🟢 剩余流量: ${result.userInfo.total > 0 ? formatBytes(Math.max(result.userInfo.total - used, 0)) : "未知"}`,
       `⏳ 过期时间: ${result.userInfo.expire ? formatDate(result.userInfo.expire) : "长期有效"}`,
@@ -700,10 +700,10 @@ function formatSubscriptionMessage(result: ParsedSubscription, subUrl: string): 
       `🔁 流量重置: ${formatResetDay(result.userInfo.resetDay)}`
     ]);
   } else {
-    appendTextBlock(message, ["📈 流量详情: 订阅未提供流量头"]);
+    appendBlockQuote(message, ["📈 流量详情: 订阅未提供流量头"]);
   }
 
-  appendTextBlock(message, [
+  appendBlockQuote(message, [
     `🌐 节点总数: ${result.nodes.length}`,
     `✅ 可用节点: ${usableNodes.length}`,
     `🧩 协议类型: ${formatCounts(protocols) || "未知"}`,
@@ -716,7 +716,7 @@ function formatSubscriptionMessage(result: ParsedSubscription, subUrl: string): 
 function formatSubscriptionWithNodesMessage(cached: CachedSubscription): FormattedText {
   const message = formatSubscriptionMessage(cached, cached.url);
   appendLine(message);
-  appendTextBlock(message, ["节点列表:", ...formatNodeListLines(cached.nodes)]);
+  appendBlockQuote(message, ["节点列表:", ...formatNodeListLines(cached.nodes)]);
   return clipFormattedText(trimFormattedText(message), 4096);
 }
 
@@ -730,7 +730,7 @@ function formatSingleNodeMessage(uri: string): FormattedText {
 
   appendLine(message, "节点解析结果");
   appendLine(message);
-  appendTextBlock(message, [
+  appendBlockQuote(message, [
     `节点名称: ${node.name}`,
     `协议类型: ${node.protocol}`,
     `节点地区: ${node.region}`
@@ -762,15 +762,28 @@ function appendLine(message: FormattedText, line = ""): void {
   message.text += `${line}\n`;
 }
 
+function appendAirportNameLine(message: FormattedText, airportName: string): void {
+  const prefix = "📋 机场名称: ";
+  const offset = message.text.length + prefix.length;
+  message.text += `${prefix}${airportName}\n`;
+  if (looksLikeHostname(airportName)) {
+    message.entities.push({ type: "url", offset, length: airportName.length });
+  }
+}
+
 function appendCodeLine(message: FormattedText, value: string): void {
   const offset = message.text.length;
   message.text += `${value}\n`;
   message.entities.push({ type: "code", offset, length: value.length });
 }
 
-function appendTextBlock(message: FormattedText, lines: string[]): void {
+function appendBlockQuote(message: FormattedText, lines: string[]): void {
   const block = lines.join("\n");
+  const offset = message.text.length;
   message.text += `${block}\n`;
+  if (block.length > 0) {
+    message.entities.push({ type: "blockquote", offset, length: block.length });
+  }
 }
 
 function trimFormattedText(message: FormattedText): FormattedText {
@@ -799,6 +812,10 @@ function clipFormattedText(message: FormattedText, maxLength: number): Formatted
 
 function cleanDisplayText(value: string): string {
   return value.replace(/\s+/g, " ").trim();
+}
+
+function looksLikeHostname(value: string): boolean {
+  return /^[a-z0-9.-]+\.[a-z]{2,}$/i.test(value.trim());
 }
 async function sendMessage(env: Env, chatId: number, text: string, replyMarkup?: unknown, replyToMessageId?: number): Promise<void> {
   await telegramApi(env, "sendMessage", {
@@ -1010,18 +1027,56 @@ function maskUrl(value: string): string {
   }
 }
 
-function detectAirportName(url: string, raw: string): string {
+function detectAirportName(url: string, raw: string, headers?: Headers, finalUrl?: string): string {
+  const headerName = detectAirportNameFromHeaders(headers);
+  if (headerName) return headerName;
+
   const yamlName = raw.match(/^\s*(?:profile|airport|subscription)?\s*name\s*:\s*['"]?([^'"\n]+)['"]?\s*$/im)?.[1]?.trim();
   if (yamlName && yamlName.length <= 40) return yamlName;
 
-  const host = safeHostname(url);
+  const host = safeHostname(finalUrl ?? url);
   const knownNames: Array<[RegExp, string]> = [
     [/nekocloud/i, "Neko Cloud"],
     [/liangxin/i, "良心云"],
+    [/seele/i, "Seele Cloud"],
+    [/hinetlove/i, "Seele Cloud"],
     [/zznot/i, "ZZNot"],
     [/tag/i, "TAG"]
   ];
   return knownNames.find(([pattern]) => pattern.test(host))?.[1] ?? host.replace(/^api\./, "");
+}
+
+function detectAirportNameFromHeaders(headers?: Headers): string | null {
+  if (!headers) return null;
+
+  for (const key of ["profile-title", "profile-web-title", "subscription-title", "x-subscription-title"]) {
+    const value = cleanAirportName(headers.get(key));
+    if (value) return value;
+  }
+
+  return cleanAirportName(parseContentDispositionFilename(headers.get("content-disposition")));
+}
+
+function parseContentDispositionFilename(value: string | null): string | null {
+  if (!value) return null;
+
+  const encodedMatch = value.match(/filename\*\s*=\s*(?:UTF-8''|utf-8'')?([^;]+)/i);
+  if (encodedMatch) return safeDecodeURIComponent(trimHeaderValue(encodedMatch[1]));
+
+  const filenameMatch = value.match(/filename\s*=\s*([^;]+)/i);
+  if (filenameMatch) return trimHeaderValue(filenameMatch[1]);
+
+  return null;
+}
+
+function trimHeaderValue(value: string): string {
+  return value.trim().replace(/^["']|["']$/g, "");
+}
+
+function cleanAirportName(value: string | null): string | null {
+  const cleaned = value?.replace(/\.(yaml|yml|txt|conf)$/i, "").trim();
+  if (!cleaned || cleaned.length > 60) return null;
+  return cleaned;
 }
 
 function safeHostname(value: string): string {
