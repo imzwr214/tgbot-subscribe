@@ -1,6 +1,7 @@
 interface Env {
   BOT_TOKEN: string;
-  ALLOWED_USER_IDS: string;
+  ADMIN_USER_IDS?: string;
+  ALLOWED_USER_IDS?: string;
   DEBUG_TOKEN?: string;
   SETUP_TOKEN?: string;
   SUB_FETCH_PREFIX?: string;
@@ -72,9 +73,19 @@ interface CachedSubscription extends ParsedSubscription {
   updatedAt: string;
 }
 
-interface SavedSubscription {
+interface LegacySavedSubscription {
   url: string;
   updatedAt: string;
+}
+
+interface SavedSubscriptionItem {
+  id: string;
+  name: string;
+  url: string;
+  airportName?: string;
+  createdAt: string;
+  updatedAt: string;
+  lastQueryAt?: string;
 }
 
 interface ShortSubscription {
@@ -98,12 +109,14 @@ interface FormattedText {
 interface CallbackAction {
   name: string;
   cacheId?: string;
+  subId?: string;
 }
 
 const CACHE_TTL_SECONDS = 60 * 30;
 const SHORT_LINK_TTL_SECONDS = 60 * 60 * 24 * 30;
 const REQUEST_TIMEOUT_MS = 8000;
 const PREFERRED_UA = "clash-verge/v2.0.0";
+const AUTHORIZED_USERS_KEY = "authorized_users";
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -164,7 +177,7 @@ async function debugSubscription(url: URL, env: Env): Promise<Response> {
 
   const userId = Number(url.searchParams.get("user_id") ?? "");
   const targetUrl = url.searchParams.get("url");
-  if (!userId || !isAllowedUser(userId, env)) {
+  if (!userId || !(await isAllowedUser(userId, env))) {
     return json({ ok: false, error: "unauthorized" }, 403);
   }
   if (!targetUrl) {
@@ -195,25 +208,57 @@ async function handleTelegramUpdate(update: TelegramUpdate, request: Request, en
 
 async function handleMessage(message: TelegramMessage, request: Request, env: Env): Promise<void> {
   const userId = message.from?.id;
-  if (!userId || !isAllowedUser(userId, env)) {
-    await sendMessage(env, message.chat.id, "未授权用户，已拒绝访问。");
+  const text = (message.text ?? "").trim();
+  const command = text.split(/\s+/)[0]?.replace(/@[A-Za-z0-9_]+$/, "") ?? "";
+
+  if (command === "/whoami") {
+    if (!userId) {
+      await sendMessage(env, message.chat.id, "无法识别你的 Telegram user id。");
+      return;
+    }
+    await sendMessage(env, message.chat.id, `你的 Telegram user id 是：${userId}\n请把这个 ID 发给管理员授权。`);
     return;
   }
 
-  const text = (message.text ?? "").trim();
-  const command = text.split(/\s+/)[0]?.replace(/@[A-Za-z0-9_]+$/, "") ?? "";
+  if (!userId || !(await isAllowedUser(userId, env))) {
+    await sendMessage(env, message.chat.id, "未授权，请联系管理员授权");
+    return;
+  }
+
+  if (command === "/users") {
+    if (!isAdminUser(userId, env)) {
+      await sendMessage(env, message.chat.id, "只有管理员可以查看授权用户列表。");
+      return;
+    }
+    await sendMessage(env, message.chat.id, await formatAuthorizedUsersMessage(env));
+    return;
+  }
+
+  if (command === "/allow") {
+    if (!isAdminUser(userId, env)) {
+      await sendMessage(env, message.chat.id, "只有管理员可以授权用户。");
+      return;
+    }
+    await handleAllowCommand(message, env, text);
+    return;
+  }
+
+  if (command === "/revoke") {
+    if (!isAdminUser(userId, env)) {
+      await sendMessage(env, message.chat.id, "只有管理员可以取消授权用户。");
+      return;
+    }
+    await handleRevokeCommand(message, env, text);
+    return;
+  }
+
   if (command === "/start" || command === "/help") {
-    await sendMessage(env, message.chat.id, helpText(), mainKeyboard());
+    await sendMessage(env, message.chat.id, helpTextV2(), mainKeyboardV2());
     return;
   }
 
   if (command === "/sub") {
-    const saved = await getSavedSubscription(env, userId);
-    if (!saved) {
-      await sendMessage(env, message.chat.id, "还没有保存订阅。请先发送订阅链接，然后点击“保存订阅”。");
-      return;
-    }
-    await queryAndSend(saved.url, userId, message.chat.id, env);
+    await sendSubscriptionList(env, message.chat.id, userId);
     return;
   }
 
@@ -247,8 +292,29 @@ async function handleCallback(callback: TelegramCallbackQuery, request: Request,
     return;
   }
 
-  if (!isAllowedUser(userId, env)) {
-    await sendMessage(env, chatId, "未授权用户，已拒绝访问。");
+  if (!(await isAllowedUser(userId, env))) {
+    await sendMessage(env, chatId, "未授权，请联系管理员授权");
+    return;
+  }
+
+  if (action.name === "cancel") {
+    const saved = await getSavedSubscriptions(env, userId);
+    await editCallbackMessage(env, callback, formatSubscriptionListText(saved), subscriptionListKeyboard(saved));
+    return;
+  }
+
+  if (action.name === "query_saved" && action.subId) {
+    await querySavedSubscription(action.subId, userId, callback, env);
+    return;
+  }
+
+  if (action.name === "delete_saved" && action.subId) {
+    await confirmDeleteSavedSubscription(action.subId, userId, callback, env);
+    return;
+  }
+
+  if (action.name === "confirm_delete_saved" && action.subId) {
+    await deleteSavedSubscriptionFromCallback(action.subId, userId, callback, env);
     return;
   }
 
@@ -259,10 +325,10 @@ async function handleCallback(callback: TelegramCallbackQuery, request: Request,
   }
 
   if (action.name === "refresh") {
-    const saved = await getSavedSubscription(env, userId);
-    const subUrl = cached?.url ?? saved?.url;
+    const saved = await getSavedSubscriptions(env, userId);
+    const subUrl = cached?.url ?? (saved.length === 1 ? saved[0].url : undefined);
     if (!subUrl) {
-      await sendMessage(env, chatId, "没有可刷新的订阅，请先发送订阅链接。");
+      await editCallbackMessage(env, callback, formatSubscriptionListText(saved), subscriptionListKeyboard(saved));
       return;
     }
     await queryAndEdit(subUrl, userId, callback, env, action.cacheId);
@@ -290,8 +356,8 @@ async function handleCallback(callback: TelegramCallbackQuery, request: Request,
   }
 
   if (action.name === "save" && cached) {
-    await saveSubscription(env, userId, cached.url);
-    await sendMessage(env, chatId, "已保存当前订阅。以后发送 /sub 可直接查询。");
+    const saved = await saveSubscription(env, userId, cached);
+    await sendMessage(env, chatId, `已保存订阅：${saved.name}\n以后发送 /sub 可以查看自己的订阅列表。`);
     return;
   }
 
@@ -325,6 +391,91 @@ async function queryAndEdit(subUrl: string, userId: number, callback: TelegramCa
   } catch (error) {
     await editCallbackMessage(env, callback, `订阅查询失败：${safeError(error)}`, actionKeyboard(false, existingCacheId));
   }
+}
+
+async function sendSubscriptionList(env: Env, chatId: number, userId: number): Promise<void> {
+  const subscriptions = await getSavedSubscriptions(env, userId);
+  await sendMessage(env, chatId, formatSubscriptionListText(subscriptions), subscriptionListKeyboard(subscriptions));
+}
+
+function formatSubscriptionListText(subscriptions: SavedSubscriptionItem[]): string {
+  if (subscriptions.length === 0) {
+    return "还没有保存订阅。请先发送订阅链接，查询成功后点击“保存订阅”。";
+  }
+
+  const lines = ["你的订阅列表："];
+  for (const [index, item] of subscriptions.entries()) {
+    const updatedAt = item.updatedAt.slice(0, 10);
+    lines.push(`${index + 1}. ${item.name}（更新：${updatedAt}）`);
+  }
+  return lines.join("\n");
+}
+
+function subscriptionListKeyboard(subscriptions: SavedSubscriptionItem[]) {
+  if (subscriptions.length === 0) return undefined;
+
+  return {
+    inline_keyboard: subscriptions.map((item, index) => [
+      { text: `查询 ${index + 1}`, callback_data: `query_saved:${item.id}` },
+      { text: `删除 ${index + 1}`, callback_data: `delete_saved:${item.id}` }
+    ])
+  };
+}
+
+async function querySavedSubscription(subId: string, userId: number, callback: TelegramCallbackQuery, env: Env): Promise<void> {
+  const subscriptions = await getSavedSubscriptions(env, userId);
+  const item = subscriptions.find((subscription) => subscription.id === subId);
+  if (!item) {
+    await editCallbackMessage(env, callback, "订阅不存在或已经删除。", subscriptionListKeyboard(subscriptions));
+    return;
+  }
+
+  try {
+    const result = await fetchAndParseSubscription(item.url, env);
+    const cacheId = createCacheId();
+    await cacheSubscription(env, userId, { url: item.url, updatedAt: new Date().toISOString(), ...result }, cacheId);
+    await touchSavedSubscriptionLastQueryAt(env, userId, subId);
+    await editCallbackMessage(env, callback, formatSubscriptionMessage(result, item.url), actionKeyboard(false, cacheId));
+  } catch (error) {
+    await editCallbackMessage(env, callback, `订阅查询失败：${safeError(error)}`, subscriptionListKeyboard(subscriptions));
+  }
+}
+
+async function confirmDeleteSavedSubscription(subId: string, userId: number, callback: TelegramCallbackQuery, env: Env): Promise<void> {
+  const subscriptions = await getSavedSubscriptions(env, userId);
+  const item = subscriptions.find((subscription) => subscription.id === subId);
+  if (!item) {
+    await editCallbackMessage(env, callback, "订阅不存在或已经删除。", subscriptionListKeyboard(subscriptions));
+    return;
+  }
+
+  await editCallbackMessage(env, callback, `确认删除订阅“${item.name}”？`, {
+    inline_keyboard: [
+      [{ text: "确认删除", callback_data: `confirm_delete_saved:${item.id}` }],
+      [{ text: "取消", callback_data: "cancel" }]
+    ]
+  });
+}
+
+async function deleteSavedSubscriptionFromCallback(subId: string, userId: number, callback: TelegramCallbackQuery, env: Env): Promise<void> {
+  const subscriptions = await getSavedSubscriptions(env, userId);
+  const item = subscriptions.find((subscription) => subscription.id === subId);
+  if (!item) {
+    await editCallbackMessage(env, callback, "订阅不存在或已经删除。", subscriptionListKeyboard(subscriptions));
+    return;
+  }
+
+  const nextSubscriptions = subscriptions.filter((subscription) => subscription.id !== subId);
+  await putSavedSubscriptions(env, userId, nextSubscriptions);
+  await editCallbackMessage(env, callback, `已删除订阅：${item.name}\n\n${formatSubscriptionListText(nextSubscriptions)}`, subscriptionListKeyboard(nextSubscriptions));
+}
+
+async function touchSavedSubscriptionLastQueryAt(env: Env, userId: number, subId: string): Promise<void> {
+  const subscriptions = await getSavedSubscriptions(env, userId);
+  const item = subscriptions.find((subscription) => subscription.id === subId);
+  if (!item) return;
+  item.lastQueryAt = new Date().toISOString();
+  await putSavedSubscriptions(env, userId, subscriptions);
 }
 
 async function exportDebugJsonForReply(message: TelegramMessage, userId: number, env: Env): Promise<void> {
@@ -731,6 +882,26 @@ function helpText(): string {
   ].join("\n");
 }
 
+function mainKeyboardV2() {
+  return { inline_keyboard: [[{ text: "查看已保存订阅", callback_data: "refresh" }]] };
+}
+
+function helpTextV2(): string {
+  return [
+    "发送订阅链接，我会查询流量、过期时间和节点列表。",
+    "",
+    "可用命令：",
+    "/whoami 查看自己的 Telegram user id",
+    "/sub 查看自己的订阅列表",
+    "/users 管理员查看授权用户",
+    "/allow <userId> 管理员授权用户",
+    "/revoke <userId> 管理员取消授权用户",
+    "/help 查看帮助",
+    "",
+    "未授权用户只能使用 /whoami。"
+  ].join("\n");
+}
+
 function formatSubscriptionMessage(result: ParsedSubscription, subUrl: string): FormattedText {
   const usableNodes = getUsableNodes(result.nodes);
   const protocols = countBy(usableNodes.map((node) => node.protocol));
@@ -975,12 +1146,91 @@ async function telegramMultipartApi(env: Env, method: string, form: FormData): P
   return result;
 }
 
-async function getSavedSubscription(env: Env, userId: number): Promise<SavedSubscription | null> {
-  return env.SUB_KV.get(`user:${userId}:subscription`, "json");
+async function getSavedSubscriptions(env: Env, userId: number): Promise<SavedSubscriptionItem[]> {
+  const key = savedSubscriptionsKey(userId);
+  const existing = await env.SUB_KV.get<SavedSubscriptionItem[]>(key, "json");
+  if (Array.isArray(existing)) {
+    return existing.filter(isSavedSubscriptionItem);
+  }
+
+  const legacy = await env.SUB_KV.get<LegacySavedSubscription>(legacySavedSubscriptionKey(userId), "json");
+  if (!legacy?.url) {
+    return [];
+  }
+
+  const now = new Date().toISOString();
+  const migrated: SavedSubscriptionItem[] = [{
+    id: createSubscriptionId(),
+    name: subscriptionNameFromUrl(legacy.url),
+    url: legacy.url,
+    createdAt: legacy.updatedAt || now,
+    updatedAt: legacy.updatedAt || now
+  }];
+  await putSavedSubscriptions(env, userId, migrated);
+  return migrated;
 }
 
-async function saveSubscription(env: Env, userId: number, url: string): Promise<void> {
-  await env.SUB_KV.put(`user:${userId}:subscription`, JSON.stringify({ url, updatedAt: new Date().toISOString() }));
+async function saveSubscription(env: Env, userId: number, cached: CachedSubscription): Promise<SavedSubscriptionItem> {
+  const subscriptions = await getSavedSubscriptions(env, userId);
+  const now = new Date().toISOString();
+  const existing = subscriptions.find((item) => item.url === cached.url);
+  if (existing) {
+    existing.name = savedSubscriptionName(cached);
+    existing.airportName = cached.airportName;
+    existing.updatedAt = now;
+    await putSavedSubscriptions(env, userId, subscriptions);
+    return existing;
+  }
+
+  const item: SavedSubscriptionItem = {
+    id: createSubscriptionId(),
+    name: savedSubscriptionName(cached),
+    url: cached.url,
+    airportName: cached.airportName,
+    createdAt: now,
+    updatedAt: now
+  };
+  subscriptions.push(item);
+  await putSavedSubscriptions(env, userId, subscriptions);
+  return item;
+}
+
+async function putSavedSubscriptions(env: Env, userId: number, subscriptions: SavedSubscriptionItem[]): Promise<void> {
+  await env.SUB_KV.put(savedSubscriptionsKey(userId), JSON.stringify(subscriptions));
+}
+
+function savedSubscriptionsKey(userId: number): string {
+  return `user:${userId}:subscriptions`;
+}
+
+function legacySavedSubscriptionKey(userId: number): string {
+  return `user:${userId}:subscription`;
+}
+
+function isSavedSubscriptionItem(value: unknown): value is SavedSubscriptionItem {
+  if (!value || typeof value !== "object") return false;
+  const item = value as Partial<SavedSubscriptionItem>;
+  return (
+    typeof item.id === "string" &&
+    typeof item.name === "string" &&
+    typeof item.url === "string" &&
+    typeof item.createdAt === "string" &&
+    typeof item.updatedAt === "string"
+  );
+}
+
+function savedSubscriptionName(cached: CachedSubscription): string {
+  const name = cached.airportName?.trim();
+  return name || subscriptionNameFromUrl(cached.url);
+}
+
+function subscriptionNameFromUrl(value: string): string {
+  try {
+    const hostname = new URL(value).hostname.replace(/^api\./, "");
+    return hostname || "未命名订阅";
+  } catch {
+    return "未命名订阅";
+  }
 }
 
 async function getCachedSubscription(env: Env, userId: number, cacheId?: string): Promise<CachedSubscription | null> {
@@ -1002,9 +1252,19 @@ function createCacheId(): string {
   return crypto.randomUUID().replace(/-/g, "").slice(0, 12);
 }
 
+function createSubscriptionId(): string {
+  return crypto.randomUUID().replace(/-/g, "").slice(0, 12);
+}
+
 function parseCallbackAction(data: string): CallbackAction {
-  const [name, cacheId] = data.split(":", 2);
-  return { name, cacheId: cacheId && /^[a-f0-9]{12}$/i.test(cacheId) ? cacheId : undefined };
+  if (data === "cancel") return { name: "cancel" };
+
+  const [name, value] = data.split(":", 2);
+  if (["query_saved", "delete_saved", "confirm_delete_saved"].includes(name)) {
+    return { name, subId: value && /^[a-f0-9]{12}$/i.test(value) ? value : undefined };
+  }
+
+  return { name, cacheId: value && /^[a-f0-9]{12}$/i.test(value) ? value : undefined };
 }
 
 async function createShortLink(env: Env, userId: number, url: string): Promise<string> {
@@ -1030,9 +1290,121 @@ async function exportShortLink(shortId: string, env: Env): Promise<Response> {
   });
 }
 
-function isAllowedUser(userId: number, env: Env): boolean {
-  const ids = env.ALLOWED_USER_IDS.split(",").map((item) => item.trim()).filter(Boolean);
-  return ids.length > 0 && ids.includes(String(userId));
+async function isAllowedUser(userId: number, env: Env): Promise<boolean> {
+  const id = String(userId);
+  if (isAdminUser(userId, env)) return true;
+  if (parseUserIdList(env.ALLOWED_USER_IDS).has(id)) return true;
+  return (await getKvAuthorizedUserIds(env)).has(id);
+}
+
+function isAdminUser(userId: number, env: Env): boolean {
+  return parseUserIdList(env.ADMIN_USER_IDS).has(String(userId));
+}
+
+async function handleAllowCommand(message: TelegramMessage, env: Env, text: string): Promise<void> {
+  const targetUserId = parseCommandUserId(text);
+  if (!targetUserId) {
+    await sendMessage(env, message.chat.id, "用法：/allow <userId>");
+    return;
+  }
+
+  const admins = parseUserIdList(env.ADMIN_USER_IDS);
+  const envAllowed = parseUserIdList(env.ALLOWED_USER_IDS);
+  const kvAllowed = await getKvAuthorizedUserIds(env);
+  if (admins.has(targetUserId) || envAllowed.has(targetUserId) || kvAllowed.has(targetUserId)) {
+    await sendMessage(env, message.chat.id, `用户 ${targetUserId} 已授权`);
+    return;
+  }
+
+  kvAllowed.add(targetUserId);
+  await putKvAuthorizedUserIds(env, kvAllowed);
+  await sendMessage(env, message.chat.id, `已授权用户 ${targetUserId}`);
+}
+
+async function handleRevokeCommand(message: TelegramMessage, env: Env, text: string): Promise<void> {
+  const targetUserId = parseCommandUserId(text);
+  if (!targetUserId) {
+    await sendMessage(env, message.chat.id, "用法：/revoke <userId>");
+    return;
+  }
+
+  if (parseUserIdList(env.ADMIN_USER_IDS).has(targetUserId)) {
+    await sendMessage(env, message.chat.id, "不能取消授权管理员用户。");
+    return;
+  }
+
+  if (parseUserIdList(env.ALLOWED_USER_IDS).has(targetUserId)) {
+    await sendMessage(env, message.chat.id, "该用户来自环境变量白名单，请到 Cloudflare 环境变量中移除");
+    return;
+  }
+
+  const kvAllowed = await getKvAuthorizedUserIds(env);
+  if (!kvAllowed.has(targetUserId)) {
+    await sendMessage(env, message.chat.id, `用户 ${targetUserId} 不在 KV 授权列表中。`);
+    return;
+  }
+
+  kvAllowed.delete(targetUserId);
+  await putKvAuthorizedUserIds(env, kvAllowed);
+  await sendMessage(env, message.chat.id, `已取消授权用户 ${targetUserId}`);
+}
+
+async function formatAuthorizedUsersMessage(env: Env): Promise<string> {
+  const admins = parseUserIdList(env.ADMIN_USER_IDS);
+  const envAllowed = parseUserIdList(env.ALLOWED_USER_IDS);
+  const kvAllowed = await getKvAuthorizedUserIds(env);
+  const allUserIds = new Set([...admins, ...envAllowed, ...kvAllowed]);
+  if (allUserIds.size === 0) {
+    return "当前没有已授权用户。";
+  }
+
+  const lines = ["当前已授权用户列表："];
+  for (const userId of sortUserIds(allUserIds)) {
+    const labels: string[] = [];
+    if (admins.has(userId)) labels.push("admin");
+    if (envAllowed.has(userId)) labels.push("env allowlist");
+    if (kvAllowed.has(userId)) labels.push("kv user");
+    lines.push(`${userId} - ${labels.join(", ")}`);
+  }
+  return lines.join("\n");
+}
+
+async function getKvAuthorizedUserIds(env: Env): Promise<Set<string>> {
+  try {
+    const values = await env.SUB_KV.get<Array<string | number>>(AUTHORIZED_USERS_KEY, "json");
+    if (!Array.isArray(values)) return new Set();
+    return new Set(values.map((value) => normalizeUserId(value)).filter((value): value is string => value !== null));
+  } catch (error) {
+    console.error("failed to read authorized users", safeError(error));
+    return new Set();
+  }
+}
+
+async function putKvAuthorizedUserIds(env: Env, ids: Set<string>): Promise<void> {
+  await env.SUB_KV.put(AUTHORIZED_USERS_KEY, JSON.stringify(sortUserIds(ids)));
+}
+
+function parseUserIdList(value?: string): Set<string> {
+  return new Set((value ?? "").split(",").map((item) => normalizeUserId(item)).filter((item): item is string => item !== null));
+}
+
+function parseCommandUserId(text: string): string | null {
+  return normalizeUserId(text.split(/\s+/)[1] ?? "");
+}
+
+function normalizeUserId(value: string | number): string | null {
+  const id = String(value).trim();
+  return /^\d{1,20}$/.test(id) ? id : null;
+}
+
+function sortUserIds(ids: Iterable<string>): string[] {
+  return [...ids].sort((a, b) => {
+    const left = BigInt(a);
+    const right = BigInt(b);
+    if (left < right) return -1;
+    if (left > right) return 1;
+    return 0;
+  });
 }
 
 function extractQueryInput(text: string): QueryInput | null {

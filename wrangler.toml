@@ -3,6 +3,7 @@ main = "src/index.ts"
 compatibility_date = "2026-06-26"
 
 [vars]
+ADMIN_USER_IDS = "8429719893"
 ALLOWED_USER_IDS = "8429719893"
 SUB_FETCH_PREFIX = ""
 SUB_FETCH_PROXY = "https://tg-sub-fetch-proxy.vercel.app/api/fetch"
