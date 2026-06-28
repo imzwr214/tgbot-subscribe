@@ -680,9 +680,17 @@ function toYamlSubscription(cached: CachedSubscription): string {
 }
 
 function rawSubscriptionFilename(cached: CachedSubscription): string {
-  if (cached.sourceType === "yaml") return "subscription.yaml";
+  if (cached.sourceType === "yaml") return `${safeDocumentBasename(cached.airportName) || "subscription"}.yaml`;
   if (cached.sourceType === "base64") return "subscription-base64.txt";
   return "subscription.txt";
+}
+
+function safeDocumentBasename(value: string): string {
+  return value
+    .replace(/[\\/:*?"<>|]/g, "_")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 80);
 }
 
 function actionKeyboard(nodesExpanded = false, cacheId?: string) {
