@@ -167,7 +167,47 @@ async function setupWebhook(request: Request, env: Env, url: URL): Promise<Respo
     url: webhookUrl,
     allowed_updates: ["message", "callback_query"]
   });
-  return json({ ok: result.ok === true, webhook: webhookUrl, description: result.description ?? "" });
+  const commands = await setupBotCommands(env);
+  return json({
+    ok: result.ok === true && commands.defaultCommands,
+    webhook: webhookUrl,
+    commands,
+    description: result.description ?? ""
+  });
+}
+
+async function setupBotCommands(env: Env): Promise<{ defaultCommands: boolean; adminCommandChats: string[] }> {
+  const defaultResult = await telegramApi(env, "setMyCommands", {
+    commands: botCommands()
+  });
+
+  const adminCommandChats: string[] = [];
+  for (const adminUserId of parseUserIdList(env.ADMIN_USER_IDS)) {
+    await telegramApi(env, "setMyCommands", {
+      commands: adminBotCommands(),
+      scope: { type: "chat", chat_id: adminUserId }
+    });
+    adminCommandChats.push(adminUserId);
+  }
+
+  return { defaultCommands: defaultResult.ok === true, adminCommandChats };
+}
+
+function botCommands(): Array<{ command: string; description: string }> {
+  return [
+    { command: "whoami", description: "查看自己的 Telegram user id" },
+    { command: "sub", description: "查看自己的订阅列表" },
+    { command: "help", description: "查看帮助" }
+  ];
+}
+
+function adminBotCommands(): Array<{ command: string; description: string }> {
+  return [
+    ...botCommands(),
+    { command: "users", description: "查看授权用户列表" },
+    { command: "allow", description: "授权用户：/allow userId" },
+    { command: "revoke", description: "取消授权：/revoke userId" }
+  ];
 }
 
 async function debugSubscription(url: URL, env: Env): Promise<Response> {
