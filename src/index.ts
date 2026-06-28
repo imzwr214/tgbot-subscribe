@@ -1,6 +1,8 @@
 interface Env {
   BOT_TOKEN: string;
   ALLOWED_USER_IDS: string;
+  DEBUG_TOKEN?: string;
+  SETUP_TOKEN?: string;
   SUB_FETCH_PREFIX?: string;
   SUB_FETCH_PROXY?: string;
   SUB_KV: KVNamespace;
@@ -79,7 +81,7 @@ interface ShortSubscription {
 }
 
 interface TelegramMessageEntity {
-  type: "blockquote" | "code" | "url";
+  type: "code";
   offset: number;
   length: number;
 }
@@ -109,7 +111,11 @@ export default {
       }
 
       if (request.method === "GET" && url.pathname === "/") {
-        return setupWebhook(request, env);
+        return json({ ok: true, message: "bot running" });
+      }
+
+      if (request.method === "GET" && url.pathname === "/setup") {
+        return setupWebhook(request, env, url);
       }
 
       if (request.method === "GET" && url.pathname === "/debug/subscription") {
@@ -134,7 +140,11 @@ export default {
   }
 };
 
-async function setupWebhook(request: Request, env: Env): Promise<Response> {
+async function setupWebhook(request: Request, env: Env, url: URL): Promise<Response> {
+  if (!env.SETUP_TOKEN || url.searchParams.get("token") !== env.SETUP_TOKEN) {
+    return json({ ok: false, error: "forbidden" }, 403);
+  }
+
   const webhookUrl = `${new URL(request.url).origin}/telegram/webhook`;
   const result = await telegramApi(env, "setWebhook", {
     url: webhookUrl,
@@ -144,6 +154,10 @@ async function setupWebhook(request: Request, env: Env): Promise<Response> {
 }
 
 async function debugSubscription(url: URL, env: Env): Promise<Response> {
+  if (!env.DEBUG_TOKEN || url.searchParams.get("token") !== env.DEBUG_TOKEN) {
+    return json({ ok: false, error: "forbidden" }, 403);
+  }
+
   const userId = Number(url.searchParams.get("user_id") ?? "");
   const targetUrl = url.searchParams.get("url");
   if (!userId || !isAllowedUser(userId, env)) {
@@ -267,7 +281,7 @@ async function handleCallback(callback: TelegramCallbackQuery, request: Request,
   }
 
   if (action.name === "export_yaml" && cached) {
-    await sendTextDocument(env, chatId, "subscription.yaml", toYamlSubscription(cached), "YAML 文件已生成");
+    await sendTextDocument(env, chatId, rawSubscriptionFilename(cached), cached.raw.trim(), "原始订阅文件已生成");
     return;
   }
 
@@ -373,22 +387,22 @@ async function fetchAndParseSubscription(url: string, env: Env): Promise<ParsedS
 }
 
 function subscriptionRequestTargets(url: string, env: Env): Array<{ url: string; headers: HeadersInit; viaProxy: boolean }> {
+  const targets: Array<{ url: string; headers: HeadersInit; viaProxy: boolean }> = [];
   const proxy = env.SUB_FETCH_PROXY?.trim();
   if (proxy) {
     const proxyUrl = new URL(proxy);
     proxyUrl.searchParams.set("url", url.trim());
     proxyUrl.searchParams.set("ua", PREFERRED_UA);
     proxyUrl.searchParams.set("_ts", String(Date.now()));
-    return [
-      {
-        url: proxyUrl.toString(),
-        headers: { "Cache-Control": "no-cache", Pragma: "no-cache" },
-        viaProxy: true
-      }
-    ];
+    targets.push({
+      url: proxyUrl.toString(),
+      headers: { "Cache-Control": "no-cache", Pragma: "no-cache" },
+      viaProxy: true
+    });
   }
 
-  return subscriptionRequestHeadersList().map((headers) => ({ url, headers, viaProxy: false }));
+  targets.push(...subscriptionRequestHeadersList().map((headers) => ({ url, headers, viaProxy: false })));
+  return targets;
 }
 
 function subscriptionRequestHeadersList(): HeadersInit[] {
@@ -619,79 +633,10 @@ function toYamlSubscription(cached: CachedSubscription): string {
   return `proxies:\n${proxies.join("\n")}`;
 }
 
-function formatSubscription(result: ParsedSubscription, subUrl: string): string {
-  const usableNodes = getUsableNodes(result.nodes);
-  const protocols = countBy(usableNodes.map((node) => node.protocol));
-  const regions = countBy(usableNodes.map((node) => node.region));
-  const trafficLines: string[] = [];
-
-  if (result.userInfo) {
-    const used = result.userInfo.upload + result.userInfo.download;
-    trafficLines.push(
-      `已用/总量: ${formatBytes(used)} / ${formatBytes(result.userInfo.total)}`,
-      `剩余流量: ${result.userInfo.total > 0 ? formatBytes(Math.max(result.userInfo.total - used, 0)) : "未知"}`,
-      `过期时间: ${result.userInfo.expire ? formatDate(result.userInfo.expire) : "长期有效"}`
-    );
-  } else {
-    trafficLines.push("流量详情: 订阅未提供流量头");
-  }
-
-  return [
-    "订阅查询结果",
-    `机场名称: ${escapeHtml(result.airportName)}`,
-    `格式: ${escapeHtml(result.sourceType)}`,
-    "订阅链接:",
-    `<code>${escapeHtml(subUrl)}</code>`,
-    "",
-    "<blockquote>",
-    ...trafficLines,
-    "</blockquote>",
-    "<blockquote>",
-    `节点总数: ${result.nodes.length}`,
-    `可用节点: ${usableNodes.length}`,
-    `协议类型: ${escapeHtml(formatCounts(protocols) || "未知")}`,
-    `国家/地区: ${escapeHtml(formatCounts(regions) || "未知")}`,
-    "</blockquote>"
-  ].join("\n");
-}
-
-function formatSubscriptionWithNodes(cached: CachedSubscription): string {
-  const text = `${formatSubscription(cached, cached.url)}\n<blockquote>\n节点列表:\n${formatNodeList(cached.nodes)}\n</blockquote>`;
-  if (text.length <= 4096) {
-    return text;
-  }
-
-  return `${text.slice(0, 3980)}\n\n还有更多节点无法显示。`;
-}
-
-function formatNodeList(nodes: ParsedNode[]): string {
-  const usableNodes = getUsableNodes(nodes);
-  if (usableNodes.length === 0) return "未解析到真实代理节点。当前订阅内容可能只有说明、策略组，或使用了暂未支持的格式。";
-  const visibleNodes = usableNodes.slice(0, 80);
-  const lines = visibleNodes.map((node, index) => `${index + 1}. [${escapeHtml(node.region)}] ${escapeHtml(node.name)} (${escapeHtml(node.protocol)})`);
-  if (usableNodes.length > visibleNodes.length) {
-    lines.push(`还有 ${usableNodes.length - visibleNodes.length} 个节点未显示。`);
-  }
-  return lines.join("\n");
-}
-
-function formatSingleNode(uri: string): string {
-  const node = parseNodeLines([uri])[0];
-  if (!node) {
-    return "节点解析失败：暂不支持这个节点格式。";
-  }
-
-  return [
-    "节点解析结果",
-    "",
-    "<blockquote>",
-    `节点名称: ${escapeHtml(node.name)}`,
-    `协议类型: ${escapeHtml(node.protocol)}`,
-    `节点地区: ${escapeHtml(node.region)}`,
-    "节点链接:",
-    `<code>${escapeHtml(uri)}</code>`,
-    "</blockquote>"
-  ].join("\n");
+function rawSubscriptionFilename(cached: CachedSubscription): string {
+  if (cached.sourceType === "yaml") return "subscription.yaml";
+  if (cached.sourceType === "base64") return "subscription-base64.txt";
+  return "subscription.txt";
 }
 
 function actionKeyboard(nodesExpanded = false, cacheId?: string) {
@@ -706,7 +651,7 @@ function actionKeyboard(nodesExpanded = false, cacheId?: string) {
       ],
       [
         { text: "📥 导出Base64", callback_data: callback("export_base64") },
-        { text: "📥 导出YAML", callback_data: callback("export_yaml") }
+        { text: "📥 导出原始订阅", callback_data: callback("export_yaml") }
       ],
       [
         { text: "🔗 生成短链", callback_data: callback("short_link") },
@@ -747,18 +692,18 @@ function formatSubscriptionMessage(result: ParsedSubscription, subUrl: string): 
 
   if (result.userInfo) {
     const used = result.userInfo.upload + result.userInfo.download;
-    appendQuoteBlock(message, [
+    appendTextBlock(message, [
       `📈 已用/总量: ${formatBytes(used)} / ${formatBytes(result.userInfo.total)}`,
       `🟢 剩余流量: ${result.userInfo.total > 0 ? formatBytes(Math.max(result.userInfo.total - used, 0)) : "未知"}`,
       `⏳ 过期时间: ${result.userInfo.expire ? formatDate(result.userInfo.expire) : "长期有效"}`,
       `⌛ 剩余时间: ${formatExpireMinutes(result.userInfo.expire)}`,
-      `🔁 流量重置: ${formatResetMinutes(result.userInfo.expire)}`
+      `🔁 流量重置: ${formatResetDay(result.userInfo.resetDay)}`
     ]);
   } else {
-    appendQuoteBlock(message, ["📈 流量详情: 订阅未提供流量头"]);
+    appendTextBlock(message, ["📈 流量详情: 订阅未提供流量头"]);
   }
 
-  appendQuoteBlock(message, [
+  appendTextBlock(message, [
     `🌐 节点总数: ${result.nodes.length}`,
     `✅ 可用节点: ${usableNodes.length}`,
     `🧩 协议类型: ${formatCounts(protocols) || "未知"}`,
@@ -771,7 +716,7 @@ function formatSubscriptionMessage(result: ParsedSubscription, subUrl: string): 
 function formatSubscriptionWithNodesMessage(cached: CachedSubscription): FormattedText {
   const message = formatSubscriptionMessage(cached, cached.url);
   appendLine(message);
-  appendQuoteBlock(message, ["节点列表:", ...formatNodeListLines(cached.nodes)]);
+  appendTextBlock(message, ["节点列表:", ...formatNodeListLines(cached.nodes)]);
   return clipFormattedText(trimFormattedText(message), 4096);
 }
 
@@ -785,7 +730,7 @@ function formatSingleNodeMessage(uri: string): FormattedText {
 
   appendLine(message, "节点解析结果");
   appendLine(message);
-  appendQuoteBlock(message, [
+  appendTextBlock(message, [
     `节点名称: ${node.name}`,
     `协议类型: ${node.protocol}`,
     `节点地区: ${node.region}`
@@ -823,19 +768,9 @@ function appendCodeLine(message: FormattedText, value: string): void {
   message.entities.push({ type: "code", offset, length: value.length });
 }
 
-function appendUrlLine(message: FormattedText, value: string): void {
-  const offset = message.text.length;
-  message.text += `${value}\n`;
-  message.entities.push({ type: "url", offset, length: value.length });
-}
-
-function appendQuoteBlock(message: FormattedText, lines: string[]): void {
+function appendTextBlock(message: FormattedText, lines: string[]): void {
   const block = lines.join("\n");
-  const offset = message.text.length;
   message.text += `${block}\n`;
-  if (block.length > 0) {
-    message.entities.push({ type: "blockquote", offset, length: block.length });
-  }
 }
 
 function trimFormattedText(message: FormattedText): FormattedText {
@@ -869,17 +804,6 @@ async function sendMessage(env: Env, chatId: number, text: string, replyMarkup?:
   await telegramApi(env, "sendMessage", {
     chat_id: chatId,
     text: text.slice(0, 4096),
-    disable_web_page_preview: true,
-    reply_markup: replyMarkup,
-    reply_parameters: replyToMessageId ? { message_id: replyToMessageId } : undefined
-  });
-}
-
-async function sendMarkdownMessage(env: Env, chatId: number, text: string, replyMarkup?: unknown, replyToMessageId?: number): Promise<void> {
-  await telegramApi(env, "sendMessage", {
-    chat_id: chatId,
-    text: text.slice(0, 4096),
-    parse_mode: "HTML",
     disable_web_page_preview: true,
     reply_markup: replyMarkup,
     reply_parameters: replyToMessageId ? { message_id: replyToMessageId } : undefined
@@ -939,7 +863,7 @@ async function sendTextDocument(env: Env, chatId: number, filename: string, cont
   const form = new FormData();
   form.append("chat_id", String(chatId));
   if (caption) form.append("caption", caption);
-  form.append("document", new Blob([content], { type: "text/yaml;charset=utf-8" }), filename);
+  form.append("document", new Blob([content], { type: "text/plain;charset=utf-8" }), filename);
 
   await telegramMultipartApi(env, "sendDocument", form);
 }
@@ -1116,14 +1040,6 @@ function escapeCode(value: string): string {
   return value.replace(/[`\\]/g, "\\$&");
 }
 
-function escapeHtml(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
-
 function formatBytes(value: number): string {
   if (!Number.isFinite(value) || value <= 0) return "0 B";
   const units = ["B", "KB", "MB", "GB", "TB", "PB"];
@@ -1145,16 +1061,9 @@ function formatExpireMinutes(timestampSeconds: number | null): string {
   return formatDurationUntil(timestampSeconds * 1000);
 }
 
-function formatResetMinutes(expireTimestampSeconds: number | null): string {
-  if (!expireTimestampSeconds) return "未知";
-  const nowMs = Date.now();
-  const expireMs = expireTimestampSeconds * 1000;
-  if (expireMs <= nowMs) return "0 分钟";
-
-  const cycleMinutes = 30 * 24 * 60;
-  const remainingMinutes = Math.ceil((expireMs - nowMs) / 60000);
-  const minutesToReset = remainingMinutes % cycleMinutes || cycleMinutes;
-  return formatDurationMinutes(minutesToReset);
+function formatResetDay(resetDay: number | null): string {
+  if (!resetDay || resetDay < 1 || resetDay > 31) return "未知";
+  return `每月 ${resetDay} 日`;
 }
 
 function formatDurationUntil(timestampMs: number): string {

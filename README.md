@@ -1,94 +1,52 @@
-# TG Sub Bot
+# Telegram 订阅查询机器人
 
-基于 Cloudflare Workers 的 Telegram 订阅查询机器人。
+基于 Cloudflare Workers 的私人 Telegram 订阅查询机器人，支持订阅流量查询、节点统计、保存订阅、短链导出和原始订阅导出。
 
-它可以接收订阅链接，查询流量、过期时间、节点数量和地区分布，并支持保存订阅、刷新、导出 Base64/YAML、生成短链。
+## 配置
 
-## 功能
+`wrangler.toml` 里保留非敏感配置：
 
-- 私人白名单访问，避免订阅链接被陌生人滥用
-- 支持 Telegram Webhook
-- 支持 Cloudflare KV 保存订阅和短链
-- 支持读取 `subscription-userinfo` 流量头
-- 支持常见 Base64 节点订阅
-- 支持基础 Clash YAML 节点识别
+- `ALLOWED_USER_IDS`: 允许使用机器人的 Telegram 用户 ID，多个用逗号分隔。
+- `SUB_FETCH_PROXY`: 可选订阅抓取代理地址。配置后会优先走代理，代理失败后自动 fallback 到 Worker 直连并尝试多个常见 User-Agent。
+- `SUB_KV`: Cloudflare KV 命名空间绑定。
 
-## 准备
-
-1. 创建 Telegram Bot，拿到 Bot Token。
-2. 创建 Cloudflare KV namespace。
-3. 修改 `wrangler.toml` 里的 KV namespace id。
-4. 设置密钥：
+敏感值必须用 Secret 设置，不要写进代码：
 
 ```powershell
 npx wrangler secret put BOT_TOKEN
+npx wrangler secret put SETUP_TOKEN
+npx wrangler secret put DEBUG_TOKEN
 ```
 
-5. 设置白名单用户 ID：
+## 路由
 
-```toml
-[vars]
-ALLOWED_USER_IDS = "123456789"
-```
-
-多个用户用英文逗号分隔：
-
-```toml
-ALLOWED_USER_IDS = "123456789,987654321"
-```
-
-## 本地开发
-
-```powershell
-npm install
-npm run check
-npm run dev
-```
-
-## 部署
-
-```powershell
-npm run deploy
-```
-
-部署完成后，访问 Worker 根路径：
-
-```text
-https://你的-worker域名/
-```
-
-这个请求会自动调用 Telegram `setWebhook`，把 webhook 设置到：
-
-```text
-https://你的-worker域名/telegram/webhook
-```
+- `GET /`: 只返回 `bot running`，不会自动设置 webhook。
+- `GET /setup?token=xxx`: 校验 `SETUP_TOKEN` 后设置 Telegram webhook。
+- `POST /telegram/webhook`: Telegram webhook 入口。
+- `GET /debug/subscription?token=xxx&user_id=123&url=...`: 校验 `DEBUG_TOKEN` 和白名单用户后调试订阅解析。
+- `GET /s/:id`: 短链订阅导出。
+- `GET /health`: 健康检查。
 
 ## Telegram 用法
 
-- `/start` 查看提示
-- `/help` 查看帮助
-- `/sub` 查询已保存订阅
-- 直接发送订阅链接进行查询
+- `/start` 或 `/help`: 查看提示。
+- `/sub`: 查询已保存订阅。
+- `/json`: 回复某条消息发送，导出被回复消息的 JSON 文件。
+- 直接发送订阅链接: 查询流量、过期时间、节点数量、协议和地区。
+- 直接发送节点链接: 解析单个节点。
 
 按钮功能：
 
 - 刷新订阅信息
-- 显示全部节点
+- 显示全部节点 / 折叠全部节点
 - 导出 Base64
-- 导出 YAML
+- 导出原始订阅
 - 生成短链
 - 保存订阅
 
-## 安全注意
+## 注意
 
-- 不要把 `BOT_TOKEN` 写进代码或提交到 Git。
-- 不要把真实订阅链接发给不可信用户。
-- Worker 日志里只会输出脱敏后的错误信息。
-- 建议只配置自己的 Telegram 用户 ID 到白名单。
-- 如果机场屏蔽 Cloudflare Worker 出口，可以配置 `SUB_FETCH_PROXY` 为你自己控制的抓取代理地址，格式为 `https://example.com/fetch?url=订阅链接`。
-
-## 当前限制
-
-- 第一版只做轻量解析，不保证完整转换所有 Clash YAML 字段。
-- 短链默认 30 天过期。
-- 每个用户默认保存 1 条订阅。
+- 导出原始订阅不是 Clash YAML 转换，只是把订阅服务器返回的原始内容发成文件。
+- 消息格式只对订阅链接使用 `code` entity，统计内容先不用 `blockquote` entity。
+- `subscription-userinfo` 里的 `reset_day` / `resetDay` 只用于展示流量重置日；没有该字段时显示 `未知`。
+- 不要提交 Bot Token、Debug Token、Setup Token 或真实私人订阅链接。
