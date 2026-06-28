@@ -1,0 +1,14 @@
+{
+  "version": 2,
+  "functions": {
+    "api/fetch.ts": {
+      "runtime": "@vercel/node@5.5.10"
+    }
+  },
+  "routes": [
+    {
+      "src": "/api/fetch",
+      "dest": "/api/fetch.ts"
+    }
+  ]
+}
