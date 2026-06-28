@@ -48,5 +48,5 @@ npx wrangler secret put DEBUG_TOKEN
 
 - 导出原始订阅不是 Clash YAML 转换，只是把订阅服务器返回的原始内容发成文件。
 - 消息格式只对订阅链接使用 `code` entity，统计内容先不用 `blockquote` entity。
-- `subscription-userinfo` 里的 `reset_day` / `resetDay` 只用于展示流量重置日；没有该字段时显示 `未知`。
+- `subscription-userinfo` 里的 `reset_day` / `resetDay` 优先用于展示流量重置日；没有该字段时，如果响应头提供 `x-subscription-start-at` / `x-subscription-purchased-at` / `x-subscription-created-at` 和过期时间，会按 30 天周期显示“预计重置”，否则显示 `未知`。
 - 不要提交 Bot Token、Debug Token、Setup Token 或真实私人订阅链接。

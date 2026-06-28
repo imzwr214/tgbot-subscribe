@@ -40,6 +40,10 @@ interface SubscriptionUserInfo {
   total: number;
   expire: number | null;
   resetDay: number | null;
+  purchasedAt: number | null;
+  startAt: number | null;
+  nextResetAt: number | null;
+  resetEstimated: boolean;
 }
 
 interface ParsedNode {
@@ -362,10 +366,10 @@ async function fetchAndParseSubscription(url: string, env: Env): Promise<ParsedS
       const parsed = parseSubscriptionBody(raw);
       const result: ParsedSubscription = {
         raw,
-        userInfo: parseSubscriptionUserInfo(response.headers.get("subscription-userinfo")),
+        userInfo: parseSubscriptionUserInfo(response.headers),
         nodes: parsed.nodes,
         sourceType: parsed.sourceType,
-        airportName: detectAirportName(url, raw, response.headers, response.url)
+        airportName: detectAirportName(url, raw, response.headers)
       };
       const score = scoreSubscriptionResult(result);
       if (score > bestScore) {
@@ -430,7 +434,13 @@ function scoreSubscriptionResult(result: ParsedSubscription): number {
   return score;
 }
 
-function parseSubscriptionUserInfo(value: string | null): SubscriptionUserInfo | null {
+function parseSubscriptionUserInfo(headers: Headers): SubscriptionUserInfo | null {
+  const value = headers.get("subscription-userinfo");
+  const purchasedAt = parseHeaderTimestamp(
+    headers.get("x-subscription-purchased-at") ?? headers.get("x-subscription-created-at")
+  );
+  const startAt = parseHeaderTimestamp(headers.get("x-subscription-start-at"));
+
   if (!value) return null;
 
   const pairs = new Map<string, number>();
@@ -447,8 +457,44 @@ function parseSubscriptionUserInfo(value: string | null): SubscriptionUserInfo |
   const total = pairs.get("total") ?? 0;
   const expire = pairs.get("expire") ?? null;
   const resetDay = pairs.get("reset_day") ?? pairs.get("resetDay") ?? null;
-  if (upload === 0 && download === 0 && total === 0 && expire === null && resetDay === null) return null;
-  return { upload, download, total, expire, resetDay };
+  const nextResetAt = estimateNextResetAt(purchasedAt ?? startAt, expire, resetDay);
+  const resetEstimated = resetDay === null && nextResetAt !== null;
+  if (
+    upload === 0 &&
+    download === 0 &&
+    total === 0 &&
+    expire === null &&
+    resetDay === null &&
+    purchasedAt === null &&
+    startAt === null
+  ) return null;
+  return { upload, download, total, expire, resetDay, purchasedAt, startAt, nextResetAt, resetEstimated };
+}
+
+function parseHeaderTimestamp(value: string | null): number | null {
+  if (!value) return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+
+  const numberValue = Number(trimmed);
+  if (Number.isFinite(numberValue)) {
+    const seconds = numberValue > 9999999999 ? Math.floor(numberValue / 1000) : Math.floor(numberValue);
+    return seconds > 0 ? seconds : null;
+  }
+
+  const parsedMs = Date.parse(trimmed);
+  if (!Number.isFinite(parsedMs)) return null;
+  const seconds = Math.floor(parsedMs / 1000);
+  return seconds > 0 ? seconds : null;
+}
+
+function estimateNextResetAt(startSeconds: number | null, expireSeconds: number | null, resetDay: number | null): number | null {
+  if (resetDay !== null || !startSeconds || !expireSeconds) return null;
+
+  const cycleSeconds = 30 * 24 * 60 * 60;
+  const cyclesPassed = Math.floor((Date.now() / 1000 - startSeconds) / cycleSeconds) + 1;
+  const nextResetAt = startSeconds + cyclesPassed * cycleSeconds;
+  return nextResetAt > expireSeconds ? null : nextResetAt;
 }
 
 function parseSubscriptionBody(raw: string): { sourceType: ParsedSubscription["sourceType"]; nodes: ParsedNode[] } {
@@ -697,7 +743,7 @@ function formatSubscriptionMessage(result: ParsedSubscription, subUrl: string): 
       `🟢 剩余流量: ${result.userInfo.total > 0 ? formatBytes(Math.max(result.userInfo.total - used, 0)) : "未知"}`,
       `⏳ 过期时间: ${result.userInfo.expire ? formatDate(result.userInfo.expire) : "长期有效"}`,
       `⌛ 剩余时间: ${formatExpireMinutes(result.userInfo.expire)}`,
-      `🔁 流量重置: ${formatResetDay(result.userInfo.resetDay)}`
+      formatResetInfoLine(result.userInfo)
     ]);
   } else {
     appendBlockQuote(message, ["📈 流量详情: 订阅未提供流量头"]);
@@ -1027,14 +1073,14 @@ function maskUrl(value: string): string {
   }
 }
 
-function detectAirportName(url: string, raw: string, headers?: Headers, finalUrl?: string): string {
+function detectAirportName(url: string, raw: string, headers?: Headers): string {
   const headerName = detectAirportNameFromHeaders(headers);
   if (headerName) return headerName;
 
   const yamlName = raw.match(/^\s*(?:profile|airport|subscription)?\s*name\s*:\s*['"]?([^'"\n]+)['"]?\s*$/im)?.[1]?.trim();
   if (yamlName && yamlName.length <= 40) return yamlName;
 
-  const host = safeHostname(finalUrl ?? url);
+  const host = safeHostname(url);
   const knownNames: Array<[RegExp, string]> = [
     [/nekocloud/i, "Neko Cloud"],
     [/liangxin/i, "良心云"],
@@ -1119,6 +1165,20 @@ function formatExpireMinutes(timestampSeconds: number | null): string {
 function formatResetDay(resetDay: number | null): string {
   if (!resetDay || resetDay < 1 || resetDay > 31) return "未知";
   return `每月 ${resetDay} 日`;
+}
+
+function formatResetInfoLine(userInfo: SubscriptionUserInfo): string {
+  if (userInfo.resetDay && userInfo.resetDay >= 1 && userInfo.resetDay <= 31) {
+    return `🔁 流量重置: ${formatResetDay(userInfo.resetDay)}`;
+  }
+  if (userInfo.resetEstimated && userInfo.nextResetAt) {
+    return `🔁 预计重置: ${formatDateTime(userInfo.nextResetAt)}`;
+  }
+  return "🔁 流量重置: 未知";
+}
+
+function formatDateTime(timestampSeconds: number): string {
+  return new Date(timestampSeconds * 1000).toISOString().slice(0, 16).replace("T", " ");
 }
 
 function formatDurationUntil(timestampMs: number): string {

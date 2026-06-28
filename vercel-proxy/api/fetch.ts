@@ -1,6 +1,17 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 
 const REQUEST_TIMEOUT_MS = 12000;
+const FORWARDED_RESPONSE_HEADERS = [
+  "subscription-userinfo",
+  "x-subscription-start-at",
+  "x-subscription-purchased-at",
+  "x-subscription-created-at",
+  "profile-title",
+  "profile-web-title",
+  "subscription-title",
+  "x-subscription-title",
+  "content-disposition"
+];
 
 const SUBSCRIPTION_HEADERS = [
   {
@@ -81,11 +92,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const body = await response.text();
       res.setHeader("Content-Type", response.headers.get("content-type") ?? "text/plain; charset=utf-8");
       res.setHeader("Cache-Control", "no-store");
-
-      const userInfo = response.headers.get("subscription-userinfo");
-      if (userInfo) {
-        res.setHeader("subscription-userinfo", userInfo);
-      }
+      forwardResponseHeaders(response.headers, res);
       res.setHeader("x-selected-user-agent", String(headers["User-Agent"]));
 
       res.status(200).send(body);
@@ -106,5 +113,12 @@ function isAllowedHttpUrl(value: string): boolean {
     return url.protocol === "http:" || url.protocol === "https:";
   } catch {
     return false;
+  }
+}
+
+function forwardResponseHeaders(headers: Headers, res: VercelResponse) {
+  for (const key of FORWARDED_RESPONSE_HEADERS) {
+    const value = headers.get(key);
+    if (value) res.setHeader(key, value);
   }
 }
