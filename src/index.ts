@@ -196,6 +196,7 @@ async function setupBotCommands(env: Env): Promise<{ defaultCommands: boolean; a
 function botCommands(): Array<{ command: string; description: string }> {
   return [
     { command: "whoami", description: "查看自己的 Telegram user id" },
+    { command: "query", description: "群聊查询：/query 订阅链接" },
     { command: "sub", description: "查看自己的订阅列表" },
     { command: "help", description: "查看帮助" }
   ];
@@ -299,6 +300,11 @@ async function handleMessage(message: TelegramMessage, request: Request, env: En
 
   if (command === "/sub") {
     await sendSubscriptionList(env, message.chat.id, userId);
+    return;
+  }
+
+  if (command === "/query" && !extractQueryInput(text)) {
+    await sendMessage(env, message.chat.id, "用法：/query <订阅链接或节点链接>");
     return;
   }
 
@@ -932,6 +938,7 @@ function helpTextV2(): string {
     "",
     "可用命令：",
     "/whoami 查看自己的 Telegram user id",
+    "/query <订阅链接> 群聊里查询订阅",
     "/sub 查看自己的订阅列表",
     "/users 管理员查看授权用户",
     "/allow <userId> 管理员授权用户",
