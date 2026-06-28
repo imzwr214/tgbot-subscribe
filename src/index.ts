@@ -73,6 +73,14 @@ interface CachedSubscription extends ParsedSubscription {
   updatedAt: string;
 }
 
+interface CachedNode {
+  uri: string;
+  name: string;
+  protocol: string;
+  region: string;
+  updatedAt: string;
+}
+
 interface LegacySavedSubscription {
   url: string;
   updatedAt: string;
@@ -80,6 +88,7 @@ interface LegacySavedSubscription {
 
 interface SavedSubscriptionItem {
   id: string;
+  kind?: "subscription" | "node";
   name: string;
   url: string;
   airportName?: string;
@@ -320,7 +329,7 @@ async function handleMessage(message: TelegramMessage, request: Request, env: En
   }
 
   if (input.kind === "node") {
-    await sendFormattedMessage(env, message.chat.id, formatSingleNodeMessage(input.uri), undefined, message.message_id);
+    await sendNodeResult(input.uri, userId, message.chat.id, env, message.message_id);
     return;
   }
 
@@ -361,6 +370,17 @@ async function handleCallback(callback: TelegramCallbackQuery, request: Request,
 
   if (action.name === "confirm_delete_saved" && action.subId) {
     await deleteSavedSubscriptionFromCallback(action.subId, userId, callback, env);
+    return;
+  }
+
+  if (action.name === "save_node") {
+    const cachedNode = await getCachedNode(env, userId, action.cacheId);
+    if (!cachedNode) {
+      await sendMessage(env, chatId, "节点缓存已过期，请重新发送节点链接。");
+      return;
+    }
+    const saved = await saveNode(env, userId, cachedNode);
+    await sendMessage(env, chatId, `已保存节点：${saved.name}\n以后发送 /sub 可以查看自己的保存列表。`);
     return;
   }
 
@@ -428,6 +448,24 @@ async function queryAndSend(subUrl: string, userId: number, chatId: number, env:
   }
 }
 
+async function sendNodeResult(uri: string, userId: number, chatId: number, env: Env, replyToMessageId?: number): Promise<void> {
+  const node = parseNodeLines([uri])[0];
+  if (!node) {
+    await sendFormattedMessage(env, chatId, formatSingleNodeMessage(uri), undefined, replyToMessageId);
+    return;
+  }
+
+  const cacheId = createCacheId();
+  await cacheNode(env, userId, {
+    uri,
+    name: node.name,
+    protocol: node.protocol,
+    region: node.region,
+    updatedAt: new Date().toISOString()
+  }, cacheId);
+  await sendFormattedMessage(env, chatId, formatSingleNodeMessage(uri), nodeActionKeyboard(cacheId), replyToMessageId);
+}
+
 async function queryAndEdit(subUrl: string, userId: number, callback: TelegramCallbackQuery, env: Env, existingCacheId?: string): Promise<void> {
   try {
     const result = await fetchAndParseSubscription(subUrl, env);
@@ -446,13 +484,14 @@ async function sendSubscriptionList(env: Env, chatId: number, userId: number): P
 
 function formatSubscriptionListText(subscriptions: SavedSubscriptionItem[]): string {
   if (subscriptions.length === 0) {
-    return "还没有保存订阅。请先发送订阅链接，查询成功后点击“保存订阅”。";
+    return "还没有保存订阅或节点。请先发送链接，查询成功后点击保存。";
   }
 
-  const lines = ["你的订阅列表："];
+  const lines = ["你的保存列表："];
   for (const [index, item] of subscriptions.entries()) {
     const updatedAt = item.updatedAt.slice(0, 10);
-    lines.push(`${index + 1}. ${item.name}（更新：${updatedAt}）`);
+    const kindLabel = savedItemKind(item) === "node" ? "节点" : "订阅";
+    lines.push(`${index + 1}. [${kindLabel}] ${item.name}（更新：${updatedAt}）`);
   }
   return lines.join("\n");
 }
@@ -473,6 +512,12 @@ async function querySavedSubscription(subId: string, userId: number, callback: T
   const item = subscriptions.find((subscription) => subscription.id === subId);
   if (!item) {
     await editCallbackMessage(env, callback, "订阅不存在或已经删除。", subscriptionListKeyboard(subscriptions));
+    return;
+  }
+
+  if (savedItemKind(item) === "node") {
+    await touchSavedSubscriptionLastQueryAt(env, userId, subId);
+    await editCallbackMessage(env, callback, formatSingleNodeMessage(item.url));
     return;
   }
 
@@ -912,6 +957,14 @@ function actionKeyboard(nodesExpanded = false, cacheId?: string) {
   };
 }
 
+function nodeActionKeyboard(cacheId?: string) {
+  return {
+    inline_keyboard: [
+      [{ text: "保存节点", callback_data: cacheId ? `save_node:${cacheId}` : "save_node" }]
+    ]
+  };
+}
+
 function mainKeyboard() {
   return { inline_keyboard: [[{ text: "查询已保存订阅", callback_data: "refresh" }]] };
 }
@@ -1208,6 +1261,7 @@ async function getSavedSubscriptions(env: Env, userId: number): Promise<SavedSub
   const now = new Date().toISOString();
   const migrated: SavedSubscriptionItem[] = [{
     id: createSubscriptionId(),
+    kind: "subscription",
     name: subscriptionNameFromUrl(legacy.url),
     url: legacy.url,
     createdAt: legacy.updatedAt || now,
@@ -1231,9 +1285,35 @@ async function saveSubscription(env: Env, userId: number, cached: CachedSubscrip
 
   const item: SavedSubscriptionItem = {
     id: createSubscriptionId(),
+    kind: "subscription",
     name: savedSubscriptionName(cached),
     url: cached.url,
     airportName: cached.airportName,
+    createdAt: now,
+    updatedAt: now
+  };
+  subscriptions.push(item);
+  await putSavedSubscriptions(env, userId, subscriptions);
+  return item;
+}
+
+async function saveNode(env: Env, userId: number, cached: CachedNode): Promise<SavedSubscriptionItem> {
+  const subscriptions = await getSavedSubscriptions(env, userId);
+  const now = new Date().toISOString();
+  const existing = subscriptions.find((item) => item.url === cached.uri);
+  if (existing) {
+    existing.kind = "node";
+    existing.name = cached.name;
+    existing.updatedAt = now;
+    await putSavedSubscriptions(env, userId, subscriptions);
+    return existing;
+  }
+
+  const item: SavedSubscriptionItem = {
+    id: createSubscriptionId(),
+    kind: "node",
+    name: cached.name,
+    url: cached.uri,
     createdAt: now,
     updatedAt: now
   };
@@ -1259,11 +1339,16 @@ function isSavedSubscriptionItem(value: unknown): value is SavedSubscriptionItem
   const item = value as Partial<SavedSubscriptionItem>;
   return (
     typeof item.id === "string" &&
+    (item.kind === undefined || item.kind === "subscription" || item.kind === "node") &&
     typeof item.name === "string" &&
     typeof item.url === "string" &&
     typeof item.createdAt === "string" &&
     typeof item.updatedAt === "string"
   );
+}
+
+function savedItemKind(item: SavedSubscriptionItem): "subscription" | "node" {
+  return item.kind ?? "subscription";
 }
 
 function savedSubscriptionName(cached: CachedSubscription): string {
@@ -1293,6 +1378,15 @@ async function cacheSubscription(env: Env, userId: number, cached: CachedSubscri
   if (cacheId) {
     await env.SUB_KV.put(`cache:${userId}:${cacheId}`, body, { expirationTtl: CACHE_TTL_SECONDS });
   }
+}
+
+async function getCachedNode(env: Env, userId: number, cacheId?: string): Promise<CachedNode | null> {
+  if (!cacheId) return null;
+  return env.SUB_KV.get(`cache:node:${userId}:${cacheId}`, "json");
+}
+
+async function cacheNode(env: Env, userId: number, cached: CachedNode, cacheId: string): Promise<void> {
+  await env.SUB_KV.put(`cache:node:${userId}:${cacheId}`, JSON.stringify(cached), { expirationTtl: CACHE_TTL_SECONDS });
 }
 
 function createCacheId(): string {
