@@ -1776,6 +1776,9 @@ function formatResetInfoLine(userInfo: SubscriptionUserInfo): string {
   if (userInfo.resetEstimated && userInfo.nextResetAt) {
     return `🔁 预计重置: ${formatDateTime(userInfo.nextResetAt)}`;
   }
+  if (userInfo.expire) {
+    return `🔁 流量重置: 订阅未提供（按到期日估算：每月 ${new Date(userInfo.expire * 1000).getUTCDate()} 日）`;
+  }
   return "🔁 流量重置: 未知";
 }
 
