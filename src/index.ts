@@ -606,9 +606,10 @@ async function fetchAndParseSubscription(url: string, env: Env): Promise<ParsedS
       }
 
       const parsed = parseSubscriptionBody(raw);
+      const userInfo = supplementUserInfoFromNoticeNodes(parseSubscriptionUserInfo(response.headers), parsed.nodes);
       const result: ParsedSubscription = {
         raw,
-        userInfo: parseSubscriptionUserInfo(response.headers),
+        userInfo,
         nodes: parsed.nodes,
         sourceType: parsed.sourceType,
         airportName: detectAirportName(url, raw, response.headers)
@@ -737,6 +738,86 @@ function estimateNextResetAt(startSeconds: number | null, expireSeconds: number 
   const cyclesPassed = Math.floor((Date.now() / 1000 - startSeconds) / cycleSeconds) + 1;
   const nextResetAt = startSeconds + cyclesPassed * cycleSeconds;
   return nextResetAt > expireSeconds ? null : nextResetAt;
+}
+
+function supplementUserInfoFromNoticeNodes(userInfo: SubscriptionUserInfo | null, nodes: ParsedNode[]): SubscriptionUserInfo | null {
+  if (!userInfo || userInfo.resetDay !== null || userInfo.nextResetAt !== null) return userInfo;
+
+  const noticeText = nodes.filter((node) => node.isNotice).map((node) => node.name).join("\n");
+  if (!noticeText) return userInfo;
+
+  const resetDay = parseResetDayFromNoticeText(noticeText);
+  if (resetDay !== null) return { ...userInfo, resetDay };
+
+  const nextResetAt = parseNextResetAtFromNoticeText(noticeText);
+  if (nextResetAt !== null) return { ...userInfo, nextResetAt, resetEstimated: true };
+
+  return userInfo;
+}
+
+function parseResetDayFromNoticeText(text: string): number | null {
+  const patterns = [
+    /每(?:月|个月)\s*(\d{1,2})\s*(?:日|号)/i,
+    /(?:重置|续费|renew|reset)[^\d\n]{0,12}每(?:月|个月)?\s*(\d{1,2})\s*(?:日|号)/i,
+    /每(?:月|个月)?\s*(\d{1,2})\s*(?:日|号)[^\n]{0,12}(?:重置|续费|renew|reset)/i
+  ];
+
+  for (const pattern of patterns) {
+    const day = Number(text.match(pattern)?.[1]);
+    if (Number.isInteger(day) && day >= 1 && day <= 31) return day;
+  }
+  return null;
+}
+
+function parseNextResetAtFromNoticeText(text: string): number | null {
+  const explicitDate =
+    parseResetDateMatch(text.match(/(?:重置|续费|renew|reset)[^\d\n]{0,20}(\d{4})[-/.年](\d{1,2})[-/.月](\d{1,2})/i)) ??
+    parseResetDateMatch(text.match(/(\d{4})[-/.年](\d{1,2})[-/.月](\d{1,2})[^\n]{0,20}(?:重置|续费|renew|reset)/i));
+  if (explicitDate !== null) return explicitDate;
+
+  const monthDay =
+    parseMonthDayResetMatch(text.match(/(?:重置|续费)[^\d\n]{0,20}(\d{1,2})\s*月\s*(\d{1,2})\s*(?:日|号)?/i)) ??
+    parseMonthDayResetMatch(text.match(/(\d{1,2})\s*月\s*(\d{1,2})\s*(?:日|号)?[^\n]{0,20}(?:重置|续费)/i));
+  if (monthDay !== null) return monthDay;
+
+  const remainingDays =
+    parseRemainingDaysResetMatch(text.match(/(?:重置|续费|renew|reset)[^\d\n]{0,20}(\d{1,3})\s*(?:天|day|days|d)\b/i)) ??
+    parseRemainingDaysResetMatch(text.match(/(\d{1,3})\s*(?:天|day|days|d)\b[^\n]{0,20}(?:重置|续费|renew|reset)/i));
+  return remainingDays;
+}
+
+function parseResetDateMatch(match: RegExpMatchArray | null): number | null {
+  if (!match) return null;
+  return timestampFromUtcDate(Number(match[1]), Number(match[2]), Number(match[3]));
+}
+
+function parseMonthDayResetMatch(match: RegExpMatchArray | null): number | null {
+  if (!match) return null;
+  const now = new Date();
+  const month = Number(match[1]);
+  const day = Number(match[2]);
+  const currentYear = now.getUTCFullYear();
+  const currentYearTimestamp = timestampFromUtcDate(currentYear, month, day);
+  if (currentYearTimestamp === null) return null;
+  return currentYearTimestamp * 1000 + 24 * 60 * 60 * 1000 < Date.now()
+    ? timestampFromUtcDate(currentYear + 1, month, day)
+    : currentYearTimestamp;
+}
+
+function parseRemainingDaysResetMatch(match: RegExpMatchArray | null): number | null {
+  if (!match) return null;
+  const days = Number(match[1]);
+  if (!Number.isInteger(days) || days < 0 || days > 366) return null;
+  return Math.floor((Date.now() + days * 24 * 60 * 60 * 1000) / 1000);
+}
+
+function timestampFromUtcDate(year: number, month: number, day: number): number | null {
+  if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) return null;
+  if (year < 2020 || year > 2100 || month < 1 || month > 12 || day < 1 || day > 31) return null;
+
+  const date = new Date(Date.UTC(year, month - 1, day, 0, 0, 0));
+  if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) return null;
+  return Math.floor(date.getTime() / 1000);
 }
 
 function parseSubscriptionBody(raw: string): { sourceType: ParsedSubscription["sourceType"]; nodes: ParsedNode[] } {
