@@ -1771,19 +1771,40 @@ function formatResetDay(resetDay: number | null): string {
 
 function formatResetInfoLine(userInfo: SubscriptionUserInfo): string {
   if (userInfo.resetDay && userInfo.resetDay >= 1 && userInfo.resetDay <= 31) {
-    return `🔁 流量重置: ${formatResetDay(userInfo.resetDay)}`;
+    const nextResetAt = estimateNextMonthlyResetAt(userInfo.resetDay);
+    return nextResetAt
+      ? `🔁 流量重置: 预计还有 ${formatDaysUntil(nextResetAt * 1000)}（${formatResetDay(userInfo.resetDay)}）`
+      : `🔁 流量重置: ${formatResetDay(userInfo.resetDay)}`;
   }
   if (userInfo.resetEstimated && userInfo.nextResetAt) {
-    return `🔁 预计重置: ${formatDateTime(userInfo.nextResetAt)}`;
+    return `🔁 预计重置: 还有 ${formatDaysUntil(userInfo.nextResetAt * 1000)}`;
   }
   if (userInfo.expire) {
-    return `🔁 流量重置: 订阅未提供（按到期日估算：每月 ${new Date(userInfo.expire * 1000).getUTCDate()} 日）`;
+    const nextResetAt = estimateNextMonthlyResetAt(new Date(userInfo.expire * 1000).getUTCDate());
+    if (nextResetAt) return `🔁 流量重置: 订阅未提供（按到期日估算：还有 ${formatDaysUntil(nextResetAt * 1000)}）`;
   }
   return "🔁 流量重置: 未知";
 }
 
+function estimateNextMonthlyResetAt(day: number): number | null {
+  if (!Number.isInteger(day) || day < 1 || day > 31) return null;
+
+  const now = new Date();
+  for (let offset = 0; offset < 12; offset += 1) {
+    const candidateMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + offset, 1));
+    const timestamp = timestampFromUtcDate(candidateMonth.getUTCFullYear(), candidateMonth.getUTCMonth() + 1, day);
+    if (timestamp && timestamp * 1000 > Date.now()) return timestamp;
+  }
+  return null;
+}
+
 function formatDateTime(timestampSeconds: number): string {
   return new Date(timestampSeconds * 1000).toISOString().slice(0, 16).replace("T", " ");
+}
+
+function formatDaysUntil(timestampMs: number): string {
+  const days = Math.max(0, Math.ceil((timestampMs - Date.now()) / (24 * 60 * 60 * 1000)));
+  return days === 0 ? "今天" : `${days} 天`;
 }
 
 function formatDurationUntil(timestampMs: number): string {
