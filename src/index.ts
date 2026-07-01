@@ -392,7 +392,8 @@ async function handleCallback(callback: TelegramCallbackQuery, request: Request,
 
   if (action.name === "refresh") {
     const saved = await getSavedSubscriptions(env, userId);
-    const subUrl = cached?.url ?? (saved.length === 1 ? saved[0].url : undefined);
+    const cachedUrl = await getCachedSubscriptionUrl(env, userId, action.cacheId);
+    const subUrl = cached?.url ?? cachedUrl ?? (saved.length === 1 ? saved[0].url : undefined);
     if (!subUrl) {
       await editCallbackMessage(env, callback, formatSubscriptionListText(saved), subscriptionListKeyboard(saved));
       return;
@@ -1453,11 +1454,17 @@ async function getCachedSubscription(env: Env, userId: number, cacheId?: string)
   return env.SUB_KV.get(`cache:${userId}`, "json");
 }
 
+async function getCachedSubscriptionUrl(env: Env, userId: number, cacheId?: string): Promise<string | null> {
+  if (!cacheId) return null;
+  return env.SUB_KV.get(`cache-url:${userId}:${cacheId}`, "text");
+}
+
 async function cacheSubscription(env: Env, userId: number, cached: CachedSubscription, cacheId?: string): Promise<void> {
   const body = JSON.stringify(cached);
   await env.SUB_KV.put(`cache:${userId}`, body, { expirationTtl: CACHE_TTL_SECONDS });
   if (cacheId) {
     await env.SUB_KV.put(`cache:${userId}:${cacheId}`, body, { expirationTtl: CACHE_TTL_SECONDS });
+    await env.SUB_KV.put(`cache-url:${userId}:${cacheId}`, cached.url);
   }
 }
 
