@@ -4,6 +4,7 @@ interface Env {
   ALLOWED_USER_IDS?: string;
   DEBUG_TOKEN?: string;
   SETUP_TOKEN?: string;
+  WEB_TOKEN?: string;
   SUB_FETCH_PREFIX?: string;
   SUB_FETCH_PROXY?: string;
   SUB_KV: KVNamespace;
@@ -121,6 +122,14 @@ interface CallbackAction {
   subId?: string;
 }
 
+interface WebRequestBody {
+  user_id?: string | number;
+  url?: string;
+  id?: string;
+  token?: string;
+  save?: boolean;
+}
+
 const CACHE_TTL_SECONDS = 60 * 30;
 const SHORT_LINK_TTL_SECONDS = 60 * 60 * 24 * 30;
 const REQUEST_TIMEOUT_MS = 8000;
@@ -137,7 +146,26 @@ export default {
       }
 
       if (request.method === "GET" && url.pathname === "/") {
+        if ((request.headers.get("accept") ?? "").includes("text/html")) {
+          return html(webAppHtml());
+        }
         return json({ ok: true, message: "bot running" });
+      }
+
+      if (request.method === "POST" && url.pathname === "/web/query") {
+        return webQuerySubscription(request, env);
+      }
+
+      if (request.method === "POST" && url.pathname === "/web/saved") {
+        return webSavedSubscriptions(request, env);
+      }
+
+      if (request.method === "POST" && url.pathname === "/web/query-saved") {
+        return webQuerySavedSubscription(request, env);
+      }
+
+      if (request.method === "POST" && url.pathname === "/web/delete-saved") {
+        return webDeleteSavedSubscription(request, env);
       }
 
       if (request.method === "GET" && url.pathname === "/setup") {
@@ -218,6 +246,159 @@ function adminBotCommands(): Array<{ command: string; description: string }> {
     { command: "allow", description: "授权用户：/allow userId" },
     { command: "revoke", description: "取消授权：/revoke userId" }
   ];
+}
+
+async function webQuerySubscription(request: Request, env: Env): Promise<Response> {
+  const body = await readWebRequestBody(request);
+  const userId = await authorizeWebUser(request, body, env);
+  if (!userId) return json({ ok: false, error: "unauthorized" }, 403);
+
+  const subUrl = typeof body.url === "string" ? extractHttpUrl(body.url) : null;
+  if (!subUrl) return json({ ok: false, error: "missing url" }, 400);
+
+  try {
+    const result = await fetchAndParseSubscription(subUrl, env);
+    const cached: CachedSubscription = { url: subUrl, updatedAt: new Date().toISOString(), ...result };
+    const saved = body.save === false ? null : await saveSubscription(env, userId, cached);
+    return json({
+      ok: true,
+      result: webSubscriptionSummary(result),
+      saved: saved ? webSavedSubscriptionItem(saved) : null,
+      subscriptions: webSavedSubscriptionItems(await getSavedSubscriptions(env, userId))
+    });
+  } catch (error) {
+    return json({ ok: false, error: safeError(error) }, 502);
+  }
+}
+
+async function webSavedSubscriptions(request: Request, env: Env): Promise<Response> {
+  const body = await readWebRequestBody(request);
+  const userId = await authorizeWebUser(request, body, env);
+  if (!userId) return json({ ok: false, error: "unauthorized" }, 403);
+
+  return json({
+    ok: true,
+    subscriptions: webSavedSubscriptionItems(await getSavedSubscriptions(env, userId))
+  });
+}
+
+async function webQuerySavedSubscription(request: Request, env: Env): Promise<Response> {
+  const body = await readWebRequestBody(request);
+  const userId = await authorizeWebUser(request, body, env);
+  if (!userId) return json({ ok: false, error: "unauthorized" }, 403);
+  if (!isValidSubscriptionId(body.id)) return json({ ok: false, error: "missing id" }, 400);
+
+  const subscriptions = await getSavedSubscriptions(env, userId);
+  const item = subscriptions.find((subscription) => subscription.id === body.id);
+  if (!item) return json({ ok: false, error: "not found" }, 404);
+
+  if (savedItemKind(item) === "node") {
+    await touchSavedSubscriptionLastQueryAt(env, userId, item.id);
+    return json({
+      ok: true,
+      node: webNodeSummary(item.url),
+      subscriptions: webSavedSubscriptionItems(await getSavedSubscriptions(env, userId))
+    });
+  }
+
+  try {
+    const result = await fetchAndParseSubscription(item.url, env);
+    await touchSavedSubscriptionLastQueryAt(env, userId, item.id);
+    return json({
+      ok: true,
+      result: webSubscriptionSummary(result),
+      saved: webSavedSubscriptionItem(item),
+      subscriptions: webSavedSubscriptionItems(await getSavedSubscriptions(env, userId))
+    });
+  } catch (error) {
+    return json({ ok: false, error: safeError(error) }, 502);
+  }
+}
+
+async function webDeleteSavedSubscription(request: Request, env: Env): Promise<Response> {
+  const body = await readWebRequestBody(request);
+  const userId = await authorizeWebUser(request, body, env);
+  if (!userId) return json({ ok: false, error: "unauthorized" }, 403);
+  if (!isValidSubscriptionId(body.id)) return json({ ok: false, error: "missing id" }, 400);
+
+  const subscriptions = await getSavedSubscriptions(env, userId);
+  const nextSubscriptions = subscriptions.filter((subscription) => subscription.id !== body.id);
+  await putSavedSubscriptions(env, userId, nextSubscriptions);
+  return json({ ok: true, subscriptions: webSavedSubscriptionItems(nextSubscriptions) });
+}
+
+async function readWebRequestBody(request: Request): Promise<WebRequestBody> {
+  try {
+    const body = await request.json();
+    return body && typeof body === "object" ? body as WebRequestBody : {};
+  } catch {
+    return {};
+  }
+}
+
+async function authorizeWebUser(request: Request, body: WebRequestBody, env: Env): Promise<number | null> {
+  if (env.WEB_TOKEN) {
+    const token = request.headers.get("x-web-token") || (typeof body.token === "string" ? body.token : "");
+    if (token !== env.WEB_TOKEN) return null;
+  }
+
+  const userId = normalizeUserId(body.user_id ?? "");
+  if (!userId) return null;
+  const numericUserId = Number(userId);
+  return await isAllowedUser(numericUserId, env) ? numericUserId : null;
+}
+
+function isValidSubscriptionId(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{12}$/i.test(value);
+}
+
+function webSavedSubscriptionItems(subscriptions: SavedSubscriptionItem[]) {
+  return subscriptions.map(webSavedSubscriptionItem);
+}
+
+function webSavedSubscriptionItem(item: SavedSubscriptionItem) {
+  return {
+    id: item.id,
+    kind: savedItemKind(item),
+    name: item.name,
+    airportName: item.airportName,
+    updatedAt: item.updatedAt,
+    lastQueryAt: item.lastQueryAt
+  };
+}
+
+function webSubscriptionSummary(result: ParsedSubscription) {
+  const usableNodes = getUsableNodes(result.nodes);
+  const used = result.userInfo ? result.userInfo.upload + result.userInfo.download : 0;
+  return {
+    airportName: result.airportName,
+    sourceType: result.sourceType,
+    traffic: result.userInfo ? {
+      used: formatBytes(used),
+      total: result.userInfo.total > 0 ? formatBytes(result.userInfo.total) : "未知",
+      remaining: result.userInfo.total > 0 ? formatBytes(Math.max(result.userInfo.total - used, 0)) : "未知",
+      expireDate: result.userInfo.expire ? formatDate(result.userInfo.expire) : "长期有效",
+      expireIn: formatExpireMinutes(result.userInfo.expire),
+      reset: formatResetInfoLine(result.userInfo).replace(/^🔄\s*/, "")
+    } : null,
+    nodes: {
+      total: result.nodes.length,
+      usable: usableNodes.length,
+      protocols: formatCounts(countBy(usableNodes.map((node) => node.protocol))) || "未知",
+      regions: formatRegionCounts(countBy(usableNodes.map((node) => node.region))) || "未知"
+    }
+  };
+}
+
+function webNodeSummary(uri: string) {
+  const node = parseNodeLines([uri])[0];
+  if (!node) return { ok: false, error: "节点解析失败" };
+  return {
+    ok: true,
+    name: node.name,
+    protocol: node.protocol,
+    region: node.region
+  };
 }
 
 async function debugSubscription(url: URL, env: Env): Promise<Response> {
@@ -1882,6 +2063,411 @@ function escapeYaml(value: string): string {
 function safeError(error: unknown): string {
   if (error instanceof Error) return error.message.replace(/https?:\/\/[^\s]+/g, "[masked-url]");
   return "未知错误";
+}
+
+function webAppHtml(): string {
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>订阅查询</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --line: #d8dde5;
+      --text: #17202a;
+      --muted: #667085;
+      --primary: #176b87;
+      --primary-dark: #0f5268;
+      --danger: #b42318;
+      --ok: #047857;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font: 15px/1.5 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main {
+      width: min(1040px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 28px 0 36px;
+    }
+    header {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: end;
+      margin-bottom: 18px;
+    }
+    h1 {
+      margin: 0;
+      font-size: 26px;
+      line-height: 1.2;
+      font-weight: 750;
+      letter-spacing: 0;
+    }
+    .status {
+      min-height: 24px;
+      color: var(--muted);
+      text-align: right;
+    }
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1.15fr) minmax(280px, .85fr);
+      gap: 16px;
+      align-items: start;
+    }
+    section {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 16px;
+    }
+    h2 {
+      margin: 0 0 12px;
+      font-size: 16px;
+      line-height: 1.3;
+      letter-spacing: 0;
+    }
+    label {
+      display: block;
+      color: var(--muted);
+      font-size: 13px;
+      margin: 12px 0 6px;
+    }
+    input, textarea {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      color: var(--text);
+      background: #fff;
+      padding: 10px 11px;
+      font: inherit;
+    }
+    textarea {
+      min-height: 112px;
+      resize: vertical;
+    }
+    .row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+    .check {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--text);
+      margin: 12px 0;
+    }
+    .check input {
+      width: 16px;
+      height: 16px;
+    }
+    .actions {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-top: 14px;
+    }
+    button {
+      border: 1px solid transparent;
+      border-radius: 6px;
+      padding: 9px 13px;
+      min-height: 38px;
+      cursor: pointer;
+      font: inherit;
+      background: #eef2f6;
+      color: var(--text);
+    }
+    button.primary {
+      background: var(--primary);
+      color: #fff;
+    }
+    button.primary:hover { background: var(--primary-dark); }
+    button.danger {
+      color: var(--danger);
+      background: #fff5f5;
+      border-color: #ffd0d0;
+    }
+    button:disabled {
+      cursor: wait;
+      opacity: .72;
+    }
+    .result {
+      margin-top: 16px;
+      display: grid;
+      gap: 10px;
+    }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .metric {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 10px;
+      min-height: 74px;
+    }
+    .metric span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 4px;
+    }
+    .metric strong {
+      display: block;
+      overflow-wrap: anywhere;
+    }
+    .saved-list {
+      display: grid;
+      gap: 9px;
+    }
+    .saved-item {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 10px;
+    }
+    .saved-title {
+      font-weight: 700;
+      overflow-wrap: anywhere;
+    }
+    .saved-meta {
+      color: var(--muted);
+      font-size: 12px;
+      margin: 3px 0 9px;
+    }
+    .saved-actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .empty {
+      color: var(--muted);
+      border: 1px dashed var(--line);
+      border-radius: 6px;
+      padding: 16px;
+      text-align: center;
+    }
+    .ok { color: var(--ok); }
+    .error { color: var(--danger); }
+    @media (max-width: 760px) {
+      main { width: min(100% - 20px, 1040px); padding-top: 18px; }
+      header { display: block; }
+      .status { text-align: left; margin-top: 8px; }
+      .layout, .row, .metrics { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>订阅查询</h1>
+      <div id="status" class="status"></div>
+    </header>
+    <div class="layout">
+      <section>
+        <h2>查询</h2>
+        <form id="queryForm">
+          <div class="row">
+            <div>
+              <label for="userId">Telegram user id</label>
+              <input id="userId" name="userId" inputmode="numeric" autocomplete="username" required>
+            </div>
+            <div>
+              <label for="webToken">Web token</label>
+              <input id="webToken" name="webToken" type="password" autocomplete="current-password">
+            </div>
+          </div>
+          <label for="subUrl">订阅链接</label>
+          <textarea id="subUrl" name="subUrl" required></textarea>
+          <label class="check">
+            <input id="saveSub" type="checkbox" checked>
+            <span>保存到这个用户的订阅列表</span>
+          </label>
+          <div class="actions">
+            <button class="primary" type="submit">查询</button>
+            <button id="loadSaved" type="button">刷新列表</button>
+          </div>
+        </form>
+        <div id="result" class="result"></div>
+      </section>
+      <section>
+        <h2>保存列表</h2>
+        <div id="savedList" class="saved-list"></div>
+      </section>
+    </div>
+  </main>
+  <script>
+    const userId = document.getElementById("userId");
+    const webToken = document.getElementById("webToken");
+    const subUrl = document.getElementById("subUrl");
+    const saveSub = document.getElementById("saveSub");
+    const statusEl = document.getElementById("status");
+    const resultEl = document.getElementById("result");
+    const savedListEl = document.getElementById("savedList");
+    const queryForm = document.getElementById("queryForm");
+    const loadSaved = document.getElementById("loadSaved");
+
+    userId.value = localStorage.getItem("tgSubUserId") || "";
+    webToken.value = localStorage.getItem("tgSubWebToken") || "";
+
+    function setBusy(busy) {
+      for (const button of document.querySelectorAll("button")) button.disabled = busy;
+    }
+
+    function setStatus(text, type) {
+      statusEl.textContent = text || "";
+      statusEl.className = "status " + (type || "");
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "").replace(/[&<>"']/g, function (char) {
+        return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char];
+      });
+    }
+
+    async function api(path, data) {
+      localStorage.setItem("tgSubUserId", userId.value.trim());
+      localStorage.setItem("tgSubWebToken", webToken.value);
+      const response = await fetch(path, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-web-token": webToken.value
+        },
+        body: JSON.stringify(Object.assign({ user_id: userId.value.trim() }, data || {}))
+      });
+      const payload = await response.json();
+      if (!response.ok || payload.ok === false) {
+        throw new Error(payload.error || "请求失败");
+      }
+      return payload;
+    }
+
+    function renderResult(payload) {
+      if (payload.node) {
+        const node = payload.node;
+        resultEl.innerHTML = node.ok
+          ? '<div class="metric"><span>节点</span><strong>' + escapeHtml(node.name) + '</strong><div>' + escapeHtml(node.protocol) + ' / ' + escapeHtml(node.region) + '</div></div>'
+          : '<div class="empty">节点解析失败</div>';
+        return;
+      }
+
+      const result = payload.result;
+      if (!result) {
+        resultEl.innerHTML = "";
+        return;
+      }
+
+      const traffic = result.traffic;
+      resultEl.innerHTML =
+        '<div class="metrics">' +
+        metric("机场名称", result.airportName) +
+        metric("格式", result.sourceType) +
+        metric("已用/总量", traffic ? traffic.used + " / " + traffic.total : "订阅未提供") +
+        metric("剩余流量", traffic ? traffic.remaining : "未知") +
+        metric("过期时间", traffic ? traffic.expireDate + "（" + traffic.expireIn + "）" : "未知") +
+        metric("流量重置", traffic ? traffic.reset : "未知") +
+        metric("节点", result.nodes.usable + " / " + result.nodes.total) +
+        metric("协议", result.nodes.protocols) +
+        '</div>' +
+        '<div class="metric"><span>国家/地区</span><strong>' + escapeHtml(result.nodes.regions) + '</strong></div>';
+    }
+
+    function metric(label, value) {
+      return '<div class="metric"><span>' + escapeHtml(label) + '</span><strong>' + escapeHtml(value) + '</strong></div>';
+    }
+
+    function renderSaved(items) {
+      if (!items || items.length === 0) {
+        savedListEl.innerHTML = '<div class="empty">暂无保存订阅</div>';
+        return;
+      }
+      savedListEl.innerHTML = items.map(function (item) {
+        return '<div class="saved-item">' +
+          '<div class="saved-title">' + escapeHtml(item.name) + '</div>' +
+          '<div class="saved-meta">' + escapeHtml(item.kind) + ' / 更新 ' + escapeHtml(String(item.updatedAt || "").slice(0, 10)) + '</div>' +
+          '<div class="saved-actions">' +
+          '<button type="button" data-query="' + escapeHtml(item.id) + '">查询</button>' +
+          '<button class="danger" type="button" data-delete="' + escapeHtml(item.id) + '">删除</button>' +
+          '</div>' +
+          '</div>';
+      }).join("");
+    }
+
+    async function refreshSaved() {
+      if (!userId.value.trim()) return;
+      const payload = await api("/web/saved");
+      renderSaved(payload.subscriptions);
+    }
+
+    queryForm.addEventListener("submit", async function (event) {
+      event.preventDefault();
+      setBusy(true);
+      setStatus("查询中...");
+      try {
+        const payload = await api("/web/query", { url: subUrl.value, save: saveSub.checked });
+        renderResult(payload);
+        renderSaved(payload.subscriptions);
+        setStatus(payload.saved ? "已查询并保存" : "已查询", "ok");
+      } catch (error) {
+        setStatus(error.message, "error");
+      } finally {
+        setBusy(false);
+      }
+    });
+
+    loadSaved.addEventListener("click", async function () {
+      setBusy(true);
+      setStatus("读取中...");
+      try {
+        await refreshSaved();
+        setStatus("列表已刷新", "ok");
+      } catch (error) {
+        setStatus(error.message, "error");
+      } finally {
+        setBusy(false);
+      }
+    });
+
+    savedListEl.addEventListener("click", async function (event) {
+      const button = event.target.closest("button");
+      if (!button) return;
+      const queryId = button.getAttribute("data-query");
+      const deleteId = button.getAttribute("data-delete");
+      setBusy(true);
+      setStatus(queryId ? "查询中..." : "删除中...");
+      try {
+        const payload = await api(queryId ? "/web/query-saved" : "/web/delete-saved", { id: queryId || deleteId });
+        renderResult(payload);
+        renderSaved(payload.subscriptions);
+        setStatus(queryId ? "查询完成" : "已删除", "ok");
+      } catch (error) {
+        setStatus(error.message, "error");
+      } finally {
+        setBusy(false);
+      }
+    });
+
+    refreshSaved().catch(function () {});
+  </script>
+</body>
+</html>`;
+}
+
+function html(body: string, status = 200): Response {
+  return new Response(body, {
+    status,
+    headers: { "Content-Type": "text/html; charset=utf-8" }
+  });
 }
 
 function json(data: unknown, status = 200): Response {
