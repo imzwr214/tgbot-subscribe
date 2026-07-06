@@ -754,11 +754,15 @@ function subscriptionListKeyboard(subscriptions: SavedSubscriptionItem[]) {
   if (subscriptions.length === 0) return undefined;
 
   return {
-    inline_keyboard: subscriptions.map((item, index) => [
-      { text: `查询 ${index + 1}`, callback_data: `query_saved:${item.id}` },
-      { text: `删除 ${index + 1}`, callback_data: `delete_saved:${item.id}` }
+    inline_keyboard: subscriptions.map((item) => [
+      { text: savedItemButtonText(item), callback_data: `query_saved:${item.id}` },
+      { text: "删除", callback_data: `delete_saved:${item.id}` }
     ])
   };
+}
+
+function savedItemButtonText(item: SavedSubscriptionItem): string {
+  return (item.airportName || item.name || subscriptionNameFromUrl(item.url)).trim().slice(0, 40) || "未命名订阅";
 }
 
 async function querySavedSubscription(subId: string, userId: number, callback: TelegramCallbackQuery, env: Env): Promise<void> {
@@ -771,7 +775,7 @@ async function querySavedSubscription(subId: string, userId: number, callback: T
 
   if (savedItemKind(item) === "node") {
     await touchSavedSubscriptionLastQueryAt(env, userId, subId);
-    await editCallbackMessage(env, callback, formatSingleNodeMessage(item.url));
+    await editCallbackMessage(env, callback, formatSingleNodeMessage(item.url), nodeActionKeyboard(undefined, true));
     return;
   }
 
@@ -780,7 +784,7 @@ async function querySavedSubscription(subId: string, userId: number, callback: T
     const cacheId = createCacheId();
     await cacheSubscription(env, userId, { url: item.url, updatedAt: new Date().toISOString(), ...result }, cacheId);
     await touchSavedSubscriptionLastQueryAt(env, userId, subId);
-    await editCallbackMessage(env, callback, formatSubscriptionMessage(result, item.url), actionKeyboard(false, cacheId));
+    await editCallbackMessage(env, callback, formatSubscriptionMessage(result, item.url), actionKeyboard(false, cacheId, true));
   } catch (error) {
     await editCallbackMessage(env, callback, `订阅查询失败：${safeError(error)}`, subscriptionListKeyboard(subscriptions));
   }
@@ -1270,33 +1274,41 @@ function safeDocumentBasename(value: string): string {
     .slice(0, 80);
 }
 
-function actionKeyboard(nodesExpanded = false, cacheId?: string) {
+function actionKeyboard(nodesExpanded = false, cacheId?: string, backToList = false) {
   const callback = (name: string) => cacheId ? `${name}:${cacheId}` : name;
-  return {
-    inline_keyboard: [
-      [
-        { text: "🔄 刷新订阅信息", callback_data: callback("refresh") },
-        nodesExpanded
-          ? { text: "📄 折叠全部节点", callback_data: callback("collapse_nodes") }
-          : { text: "📄 显示全部节点", callback_data: callback("nodes") }
-      ],
-      [
-        { text: "📥 导出Base64", callback_data: callback("export_base64") },
-        { text: "📥 导出原始订阅", callback_data: callback("export_yaml") }
-      ],
-      [
-        { text: "🔗 生成短链", callback_data: callback("short_link") },
-        { text: "💾 保存订阅", callback_data: callback("save") }
-      ]
+  const inlineKeyboard = [
+    [
+      { text: "🔄 刷新订阅信息", callback_data: callback("refresh") },
+      nodesExpanded
+        ? { text: "📄 折叠全部节点", callback_data: callback("collapse_nodes") }
+        : { text: "📄 显示全部节点", callback_data: callback("nodes") }
+    ],
+    [
+      { text: "📥 导出Base64", callback_data: callback("export_base64") },
+      { text: "📥 导出原始订阅", callback_data: callback("export_yaml") }
+    ],
+    [
+      { text: "🔗 生成短链", callback_data: callback("short_link") },
+      { text: "💾 保存订阅", callback_data: callback("save") }
     ]
+  ];
+  if (backToList) {
+    inlineKeyboard.push([{ text: "↩️ 返回保存列表", callback_data: "cancel" }]);
+  }
+  return {
+    inline_keyboard: inlineKeyboard
   };
 }
 
-function nodeActionKeyboard(cacheId?: string) {
+function nodeActionKeyboard(cacheId?: string, backToList = false) {
+  const inlineKeyboard = [
+    [{ text: "保存节点", callback_data: cacheId ? `save_node:${cacheId}` : "save_node" }]
+  ];
+  if (backToList) {
+    inlineKeyboard.push([{ text: "↩️ 返回保存列表", callback_data: "cancel" }]);
+  }
   return {
-    inline_keyboard: [
-      [{ text: "保存节点", callback_data: cacheId ? `save_node:${cacheId}` : "save_node" }]
-    ]
+    inline_keyboard: inlineKeyboard
   };
 }
 
