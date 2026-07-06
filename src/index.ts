@@ -692,6 +692,7 @@ async function handleCallback(callback: TelegramCallbackQuery, request: Request,
 }
 
 async function queryAndSend(subUrl: string, userId: number, chatId: number, env: Env, replyToMessageId?: number): Promise<void> {
+  const loadingMessageId = await sendTemporaryStatus(env, chatId, "查询中...", replyToMessageId);
   try {
     const result = await fetchAndParseSubscription(subUrl, env);
     const cacheId = createCacheId();
@@ -699,6 +700,8 @@ async function queryAndSend(subUrl: string, userId: number, chatId: number, env:
     await sendFormattedMessage(env, chatId, formatSubscriptionMessage(result, subUrl), actionKeyboard(false, cacheId), replyToMessageId);
   } catch (error) {
     await sendMessage(env, chatId, `订阅查询失败：${safeError(error)}`, undefined, replyToMessageId);
+  } finally {
+    if (loadingMessageId) await deleteMessageSafely(env, chatId, loadingMessageId);
   }
 }
 
@@ -1489,14 +1492,28 @@ function cleanDisplayText(value: string): string {
 function looksLikeHostname(value: string): boolean {
   return /^[a-z0-9.-]+\.[a-z]{2,}$/i.test(value.trim());
 }
-async function sendMessage(env: Env, chatId: number, text: string, replyMarkup?: unknown, replyToMessageId?: number): Promise<void> {
-  await telegramApi(env, "sendMessage", {
+async function sendMessage(env: Env, chatId: number, text: string, replyMarkup?: unknown, replyToMessageId?: number): Promise<Record<string, any>> {
+  return telegramApi(env, "sendMessage", {
     chat_id: chatId,
     text: text.slice(0, 4096),
     disable_web_page_preview: true,
     reply_markup: replyMarkup,
     reply_parameters: replyToMessageId ? { message_id: replyToMessageId } : undefined
   });
+}
+
+async function sendTemporaryStatus(env: Env, chatId: number, text: string, replyToMessageId?: number): Promise<number | undefined> {
+  const result = await sendMessage(env, chatId, text, undefined, replyToMessageId);
+  const messageId = result.result?.message_id;
+  return typeof messageId === "number" ? messageId : undefined;
+}
+
+async function deleteMessageSafely(env: Env, chatId: number, messageId: number): Promise<void> {
+  try {
+    await telegramApi(env, "deleteMessage", { chat_id: chatId, message_id: messageId });
+  } catch {
+    // Ignore cleanup failures; the query result/error has already been sent.
+  }
 }
 
 async function sendFormattedMessage(env: Env, chatId: number, content: FormattedText, replyMarkup?: unknown, replyToMessageId?: number): Promise<void> {
