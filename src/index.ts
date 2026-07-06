@@ -7,6 +7,10 @@ interface Env {
   WEB_TOKEN?: string;
   SUB_FETCH_PREFIX?: string;
   SUB_FETCH_PROXY?: string;
+  BUILD_COMMIT?: string;
+  BUILD_DIRTY?: string;
+  BUILD_SOURCE_HASH?: string;
+  BUILD_TIME?: string;
   SUB_KV: KVNamespace;
 }
 
@@ -145,6 +149,16 @@ export default {
     try {
       if (request.method === "GET" && url.pathname === "/health") {
         return json({ ok: true });
+      }
+
+      if (request.method === "GET" && url.pathname === "/version") {
+        return json({
+          ok: true,
+          commit: env.BUILD_COMMIT ?? "unknown",
+          dirty: env.BUILD_DIRTY === "true",
+          sourceHash: env.BUILD_SOURCE_HASH ?? "unknown",
+          builtAt: env.BUILD_TIME ?? "unknown"
+        });
       }
 
       if (request.method === "GET" && url.pathname === "/") {
