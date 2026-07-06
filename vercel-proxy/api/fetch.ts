@@ -50,11 +50,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return;
   }
 
-  if (!isAuthorizedProxyRequest(req)) {
-    res.status(403).send("Forbidden");
-    return;
-  }
-
   const target = Array.isArray(req.query.url) ? req.query.url[0] : req.query.url;
   if (!target || !isAllowedHttpUrl(target)) {
     res.status(400).send("Missing or invalid url");
@@ -110,11 +105,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   res.status(lastStatus && lastStatus < 500 ? lastStatus : 502).send(lastMessage);
-}
-
-function isAuthorizedProxyRequest(req: VercelRequest): boolean {
-  const expectedToken = process.env.SUB_FETCH_PROXY_TOKEN;
-  return Boolean(expectedToken) && req.headers["x-proxy-token"] === expectedToken;
 }
 
 function isAllowedHttpUrl(value: string): boolean {

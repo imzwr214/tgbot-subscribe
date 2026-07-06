@@ -16,17 +16,14 @@
 npx wrangler secret put BOT_TOKEN
 npx wrangler secret put SETUP_TOKEN
 npx wrangler secret put DEBUG_TOKEN
-npx wrangler secret put SUB_FETCH_PROXY_TOKEN
 ```
-
-如果启用 Vercel 抓取代理，Vercel Production 环境变量也要设置同一个 `SUB_FETCH_PROXY_TOKEN`。
 
 ## 路由
 
 - `GET /`: 只返回 `bot running`，不会自动设置 webhook。
 - `GET /setup?token=xxx`: 校验 `SETUP_TOKEN` 后设置 Telegram webhook。
 - `POST /telegram/webhook`: Telegram webhook 入口。
-- `POST /debug/subscription`: Header 带 `x-debug-token: DEBUG_TOKEN`，JSON body 带 `user_id` 和 `url`，校验通过后调试订阅解析。
+- `GET /debug/subscription?token=xxx&user_id=123&url=...`: 校验 `DEBUG_TOKEN` 和白名单用户后调试订阅解析。
 - `GET /s/:id`: 短链订阅导出。
 - `GET /health`: 健康检查。
 
