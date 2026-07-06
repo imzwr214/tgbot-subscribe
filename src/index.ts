@@ -123,6 +123,7 @@ interface CallbackAction {
 }
 
 interface WebRequestBody {
+  admin?: string;
   user_id?: string | number;
   url?: string;
   id?: string;
@@ -135,6 +136,7 @@ const SHORT_LINK_TTL_SECONDS = 60 * 60 * 24 * 30;
 const REQUEST_TIMEOUT_MS = 8000;
 const PREFERRED_UA = "clash-verge/v2.0.0";
 const AUTHORIZED_USERS_KEY = "authorized_users";
+const WEB_ADMIN_NAME = "imzwr";
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -281,8 +283,7 @@ async function webQuerySubscription(request: Request, env: Env): Promise<Respons
 
 async function webAdminUsers(request: Request, env: Env): Promise<Response> {
   const body = await readWebRequestBody(request);
-  const adminUserId = await authorizeWebAdmin(request, body, env);
-  if (!adminUserId) return json({ ok: false, error: "unauthorized" }, 403);
+  if (!authorizeWebAdmin(request, body, env)) return json({ ok: false, error: "unauthorized" }, 403);
 
   const admins = parseUserIdList(env.ADMIN_USER_IDS);
   const envAllowed = parseUserIdList(env.ALLOWED_USER_IDS);
@@ -386,15 +387,11 @@ async function authorizeWebUser(request: Request, body: WebRequestBody, env: Env
   return await isAllowedUser(numericUserId, env) ? numericUserId : null;
 }
 
-async function authorizeWebAdmin(request: Request, body: WebRequestBody, env: Env): Promise<number | null> {
-  if (!env.WEB_TOKEN) return null;
+function authorizeWebAdmin(request: Request, body: WebRequestBody, env: Env): boolean {
+  if (!env.WEB_TOKEN) return false;
   const token = request.headers.get("x-web-token") || (typeof body.token === "string" ? body.token : "");
-  if (token !== env.WEB_TOKEN) return null;
-
-  const userId = normalizeUserId(body.user_id ?? "");
-  if (!userId) return null;
-  const numericUserId = Number(userId);
-  return isAdminUser(numericUserId, env) ? numericUserId : null;
+  if (token !== env.WEB_TOKEN) return false;
+  return typeof body.admin === "string" && body.admin.trim() === WEB_ADMIN_NAME;
 }
 
 function isValidSubscriptionId(value: unknown): value is string {
@@ -420,7 +417,7 @@ function webAdminSavedSubscriptionItem(item: SavedSubscriptionItem) {
   return {
     ...webSavedSubscriptionItem(item),
     createdAt: item.createdAt,
-    url: maskUrl(item.url)
+    url: item.url
   };
 }
 
@@ -2732,11 +2729,11 @@ function webAdminHtml(): string {
     <section>
       <div class="toolbar">
         <div>
-          <label for="userId">管理员 Telegram user id</label>
-          <input id="userId" inputmode="numeric" autocomplete="username" required>
+          <label for="adminName">管理员账号</label>
+          <input id="adminName" autocomplete="username" required>
         </div>
         <div>
-          <label for="webToken">Web token</label>
+          <label for="webToken">密码</label>
           <input id="webToken" type="password" autocomplete="current-password" required>
         </div>
         <button id="loadUsers" type="button">加载后台</button>
@@ -2748,14 +2745,14 @@ function webAdminHtml(): string {
     </section>
   </main>
   <script>
-    const userId = document.getElementById("userId");
+    const adminName = document.getElementById("adminName");
     const webToken = document.getElementById("webToken");
     const loadUsers = document.getElementById("loadUsers");
     const statusEl = document.getElementById("status");
     const summaryEl = document.getElementById("summary");
     const usersEl = document.getElementById("users");
 
-    userId.value = localStorage.getItem("tgSubUserId") || "";
+    adminName.value = localStorage.getItem("tgSubAdminName") || "imzwr";
     webToken.value = localStorage.getItem("tgSubWebToken") || "";
 
     function escapeHtml(value) {
@@ -2770,7 +2767,7 @@ function webAdminHtml(): string {
     }
 
     async function loadAdminUsers() {
-      localStorage.setItem("tgSubUserId", userId.value.trim());
+      localStorage.setItem("tgSubAdminName", adminName.value.trim());
       localStorage.setItem("tgSubWebToken", webToken.value);
       loadUsers.disabled = true;
       setStatus("加载中...");
@@ -2781,7 +2778,7 @@ function webAdminHtml(): string {
             "Content-Type": "application/json",
             "x-web-token": webToken.value
           },
-          body: JSON.stringify({ user_id: userId.value.trim() })
+          body: JSON.stringify({ admin: adminName.value.trim() })
         });
         const payload = await response.json();
         if (!response.ok || payload.ok === false) throw new Error(payload.error || "请求失败");
