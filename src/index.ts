@@ -152,8 +152,16 @@ export default {
         return json({ ok: true, message: "bot running" });
       }
 
+      if (request.method === "GET" && url.pathname === "/admin") {
+        return html(webAdminHtml());
+      }
+
       if (request.method === "POST" && url.pathname === "/web/query") {
         return webQuerySubscription(request, env);
+      }
+
+      if (request.method === "POST" && url.pathname === "/web/admin/users") {
+        return webAdminUsers(request, env);
       }
 
       if (request.method === "POST" && url.pathname === "/web/saved") {
@@ -271,6 +279,36 @@ async function webQuerySubscription(request: Request, env: Env): Promise<Respons
   }
 }
 
+async function webAdminUsers(request: Request, env: Env): Promise<Response> {
+  const body = await readWebRequestBody(request);
+  const adminUserId = await authorizeWebAdmin(request, body, env);
+  if (!adminUserId) return json({ ok: false, error: "unauthorized" }, 403);
+
+  const admins = parseUserIdList(env.ADMIN_USER_IDS);
+  const envAllowed = parseUserIdList(env.ALLOWED_USER_IDS);
+  const kvAllowed = await getKvAuthorizedUserIds(env);
+  const savedUserIds = await listSavedSubscriptionUserIds(env);
+  const userIds = sortUserIds(new Set([...admins, ...envAllowed, ...kvAllowed, ...savedUserIds]));
+  const users = [];
+
+  for (const userId of userIds) {
+    const subscriptions = await getSavedSubscriptions(env, Number(userId));
+    const labels = [];
+    if (admins.has(userId)) labels.push("admin");
+    if (envAllowed.has(userId)) labels.push("env allowlist");
+    if (kvAllowed.has(userId)) labels.push("kv user");
+    if (savedUserIds.has(userId)) labels.push("saved");
+    users.push({
+      userId,
+      labels,
+      subscriptionCount: subscriptions.length,
+      subscriptions: subscriptions.map(webAdminSavedSubscriptionItem)
+    });
+  }
+
+  return json({ ok: true, users });
+}
+
 async function webSavedSubscriptions(request: Request, env: Env): Promise<Response> {
   const body = await readWebRequestBody(request);
   const userId = await authorizeWebUser(request, body, env);
@@ -348,6 +386,17 @@ async function authorizeWebUser(request: Request, body: WebRequestBody, env: Env
   return await isAllowedUser(numericUserId, env) ? numericUserId : null;
 }
 
+async function authorizeWebAdmin(request: Request, body: WebRequestBody, env: Env): Promise<number | null> {
+  if (!env.WEB_TOKEN) return null;
+  const token = request.headers.get("x-web-token") || (typeof body.token === "string" ? body.token : "");
+  if (token !== env.WEB_TOKEN) return null;
+
+  const userId = normalizeUserId(body.user_id ?? "");
+  if (!userId) return null;
+  const numericUserId = Number(userId);
+  return isAdminUser(numericUserId, env) ? numericUserId : null;
+}
+
 function isValidSubscriptionId(value: unknown): value is string {
   return typeof value === "string" && /^[a-f0-9]{12}$/i.test(value);
 }
@@ -365,6 +414,32 @@ function webSavedSubscriptionItem(item: SavedSubscriptionItem) {
     updatedAt: item.updatedAt,
     lastQueryAt: item.lastQueryAt
   };
+}
+
+function webAdminSavedSubscriptionItem(item: SavedSubscriptionItem) {
+  return {
+    ...webSavedSubscriptionItem(item),
+    createdAt: item.createdAt,
+    url: maskUrl(item.url)
+  };
+}
+
+async function listSavedSubscriptionUserIds(env: Env): Promise<Set<string>> {
+  const userIds = new Set<string>();
+  let cursor: string | undefined;
+
+  do {
+    const options: KVNamespaceListOptions = { prefix: "user:" };
+    if (cursor) options.cursor = cursor;
+    const result = await env.SUB_KV.list(options);
+    for (const key of result.keys) {
+      const match = key.name.match(/^user:(\d+):subscriptions?$/);
+      if (match) userIds.add(match[1]);
+    }
+    cursor = result.list_complete ? undefined : result.cursor;
+  } while (cursor);
+
+  return userIds;
 }
 
 function webSubscriptionSummary(result: ParsedSubscription) {
@@ -2458,6 +2533,312 @@ function webAppHtml(): string {
     });
 
     refreshSaved().catch(function () {});
+  </script>
+</body>
+</html>`;
+}
+
+function webAdminHtml(): string {
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>订阅管理后台</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --line: #d8dde5;
+      --text: #17202a;
+      --muted: #667085;
+      --primary: #176b87;
+      --primary-dark: #0f5268;
+      --danger: #b42318;
+      --ok: #047857;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font: 15px/1.5 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main {
+      width: min(1120px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 28px 0 36px;
+    }
+    header {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: end;
+      margin-bottom: 18px;
+    }
+    h1 {
+      margin: 0;
+      font-size: 26px;
+      line-height: 1.2;
+      font-weight: 750;
+      letter-spacing: 0;
+    }
+    a { color: var(--primary); text-decoration: none; }
+    section {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 16px;
+      margin-bottom: 16px;
+    }
+    label {
+      display: block;
+      color: var(--muted);
+      font-size: 13px;
+      margin: 0 0 6px;
+    }
+    input {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      color: var(--text);
+      background: #fff;
+      padding: 10px 11px;
+      font: inherit;
+    }
+    button {
+      border: 1px solid transparent;
+      border-radius: 6px;
+      padding: 9px 13px;
+      min-height: 38px;
+      cursor: pointer;
+      font: inherit;
+      background: var(--primary);
+      color: #fff;
+    }
+    button:hover { background: var(--primary-dark); }
+    button:disabled {
+      cursor: wait;
+      opacity: .72;
+    }
+    .toolbar {
+      display: grid;
+      grid-template-columns: minmax(180px, .8fr) minmax(180px, .8fr) auto;
+      gap: 12px;
+      align-items: end;
+    }
+    .status {
+      min-height: 24px;
+      color: var(--muted);
+      text-align: right;
+    }
+    .ok { color: var(--ok); }
+    .error { color: var(--danger); }
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+    .metric, .user {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 12px;
+      background: #fff;
+    }
+    .metric span, .meta {
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .metric strong {
+      display: block;
+      font-size: 20px;
+      margin-top: 3px;
+    }
+    .users {
+      display: grid;
+      gap: 10px;
+    }
+    .user-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: start;
+      margin-bottom: 10px;
+    }
+    .user-id {
+      font-weight: 750;
+      overflow-wrap: anywhere;
+    }
+    .labels {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      margin-top: 4px;
+    }
+    .label {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 2px 8px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .subs {
+      display: grid;
+      gap: 8px;
+    }
+    .sub {
+      border-top: 1px solid var(--line);
+      padding-top: 8px;
+    }
+    .sub-title {
+      font-weight: 650;
+      overflow-wrap: anywhere;
+    }
+    .url {
+      margin-top: 4px;
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }
+    .empty {
+      color: var(--muted);
+      border: 1px dashed var(--line);
+      border-radius: 6px;
+      padding: 16px;
+      text-align: center;
+    }
+    @media (max-width: 760px) {
+      main { width: min(100% - 20px, 1120px); padding-top: 18px; }
+      header { display: block; }
+      .status { text-align: left; margin-top: 8px; }
+      .toolbar, .summary { grid-template-columns: 1fr; }
+      .user-head { display: block; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>订阅管理后台</h1>
+        <div class="meta"><a href="/">返回查询页</a></div>
+      </div>
+      <div id="status" class="status"></div>
+    </header>
+    <section>
+      <div class="toolbar">
+        <div>
+          <label for="userId">管理员 Telegram user id</label>
+          <input id="userId" inputmode="numeric" autocomplete="username" required>
+        </div>
+        <div>
+          <label for="webToken">Web token</label>
+          <input id="webToken" type="password" autocomplete="current-password" required>
+        </div>
+        <button id="loadUsers" type="button">加载后台</button>
+      </div>
+    </section>
+    <section>
+      <div id="summary" class="summary"></div>
+      <div id="users" class="users"></div>
+    </section>
+  </main>
+  <script>
+    const userId = document.getElementById("userId");
+    const webToken = document.getElementById("webToken");
+    const loadUsers = document.getElementById("loadUsers");
+    const statusEl = document.getElementById("status");
+    const summaryEl = document.getElementById("summary");
+    const usersEl = document.getElementById("users");
+
+    userId.value = localStorage.getItem("tgSubUserId") || "";
+    webToken.value = localStorage.getItem("tgSubWebToken") || "";
+
+    function escapeHtml(value) {
+      return String(value ?? "").replace(/[&<>"']/g, function (char) {
+        return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char];
+      });
+    }
+
+    function setStatus(text, type) {
+      statusEl.textContent = text || "";
+      statusEl.className = "status " + (type || "");
+    }
+
+    async function loadAdminUsers() {
+      localStorage.setItem("tgSubUserId", userId.value.trim());
+      localStorage.setItem("tgSubWebToken", webToken.value);
+      loadUsers.disabled = true;
+      setStatus("加载中...");
+      try {
+        const response = await fetch("/web/admin/users", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-web-token": webToken.value
+          },
+          body: JSON.stringify({ user_id: userId.value.trim() })
+        });
+        const payload = await response.json();
+        if (!response.ok || payload.ok === false) throw new Error(payload.error || "请求失败");
+        renderAdmin(payload.users || []);
+        setStatus("已加载", "ok");
+      } catch (error) {
+        setStatus(error.message, "error");
+      } finally {
+        loadUsers.disabled = false;
+      }
+    }
+
+    function renderAdmin(users) {
+      const totalSubs = users.reduce(function (sum, user) { return sum + user.subscriptionCount; }, 0);
+      const activeUsers = users.filter(function (user) { return user.subscriptionCount > 0; }).length;
+      summaryEl.innerHTML =
+        metric("用户数", users.length) +
+        metric("有保存订阅的用户", activeUsers) +
+        metric("保存项总数", totalSubs);
+
+      if (users.length === 0) {
+        usersEl.innerHTML = '<div class="empty">暂无用户</div>';
+        return;
+      }
+
+      usersEl.innerHTML = users.map(renderUser).join("");
+    }
+
+    function metric(label, value) {
+      return '<div class="metric"><span>' + escapeHtml(label) + '</span><strong>' + escapeHtml(value) + '</strong></div>';
+    }
+
+    function renderUser(user) {
+      const labels = (user.labels || []).map(function (label) {
+        return '<span class="label">' + escapeHtml(label) + '</span>';
+      }).join("");
+      const subs = user.subscriptions.length === 0
+        ? '<div class="empty">没有保存订阅</div>'
+        : '<div class="subs">' + user.subscriptions.map(renderSub).join("") + '</div>';
+      return '<div class="user">' +
+        '<div class="user-head">' +
+        '<div><div class="user-id">' + escapeHtml(user.userId) + '</div><div class="labels">' + labels + '</div></div>' +
+        '<div class="meta">' + escapeHtml(user.subscriptionCount) + ' 个保存项</div>' +
+        '</div>' +
+        subs +
+        '</div>';
+    }
+
+    function renderSub(item) {
+      return '<div class="sub">' +
+        '<div class="sub-title">' + escapeHtml(item.name) + '</div>' +
+        '<div class="meta">' + escapeHtml(item.kind) + ' / 创建 ' + escapeHtml(String(item.createdAt || "").slice(0, 10)) + ' / 更新 ' + escapeHtml(String(item.updatedAt || "").slice(0, 10)) + '</div>' +
+        '<div class="url">' + escapeHtml(item.url) + '</div>' +
+        '</div>';
+    }
+
+    loadUsers.addEventListener("click", loadAdminUsers);
   </script>
 </body>
 </html>`;
