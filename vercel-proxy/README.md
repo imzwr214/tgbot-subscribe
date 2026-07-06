@@ -8,6 +8,8 @@
 GET /api/fetch?url=订阅链接
 ```
 
+请求必须带 `x-proxy-token`，服务端会校验 Vercel 环境变量 `SUB_FETCH_PROXY_TOKEN`。
+
 部署后，把 Cloudflare Worker 的 `SUB_FETCH_PROXY` 设置成：
 
 ```text

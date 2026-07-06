@@ -7,6 +7,7 @@ interface Env {
   WEB_TOKEN?: string;
   SUB_FETCH_PREFIX?: string;
   SUB_FETCH_PROXY?: string;
+  SUB_FETCH_PROXY_TOKEN?: string;
   BUILD_COMMIT?: string;
   BUILD_DIRTY?: string;
   BUILD_SOURCE_HASH?: string;
@@ -196,8 +197,12 @@ export default {
         return setupWebhook(request, env, url);
       }
 
+      if (request.method === "POST" && url.pathname === "/debug/subscription") {
+        return debugSubscription(request, env);
+      }
+
       if (request.method === "GET" && url.pathname === "/debug/subscription") {
-        return debugSubscription(url, env);
+        return json({ ok: false, error: "use POST with x-debug-token header" }, 405);
       }
 
       if (request.method === "GET" && url.pathname.startsWith("/s/")) {
@@ -487,13 +492,14 @@ function webNodeSummary(uri: string) {
   };
 }
 
-async function debugSubscription(url: URL, env: Env): Promise<Response> {
-  if (!env.DEBUG_TOKEN || url.searchParams.get("token") !== env.DEBUG_TOKEN) {
+async function debugSubscription(request: Request, env: Env): Promise<Response> {
+  if (!env.DEBUG_TOKEN || request.headers.get("x-debug-token") !== env.DEBUG_TOKEN) {
     return json({ ok: false, error: "forbidden" }, 403);
   }
 
-  const userId = Number(url.searchParams.get("user_id") ?? "");
-  const targetUrl = url.searchParams.get("url");
+  const body = await readWebRequestBody(request);
+  const userId = Number(normalizeUserId(body.user_id ?? "") ?? "");
+  const targetUrl = typeof body.url === "string" ? extractHttpUrl(body.url) : null;
   if (!userId || !(await isAllowedUser(userId, env))) {
     return json({ ok: false, error: "unauthorized" }, 403);
   }
@@ -918,13 +924,19 @@ function subscriptionRequestTargets(url: string, env: Env): Array<{ url: string;
     proxyUrl.searchParams.set("_ts", String(Date.now()));
     targets.push({
       url: proxyUrl.toString(),
-      headers: { "Cache-Control": "no-cache", Pragma: "no-cache" },
+      headers: proxyRequestHeaders(env),
       viaProxy: true
     });
   }
 
   targets.push(...subscriptionRequestHeadersList().map((headers) => ({ url, headers, viaProxy: false })));
   return targets;
+}
+
+function proxyRequestHeaders(env: Env): HeadersInit {
+  const headers: Record<string, string> = { "Cache-Control": "no-cache", Pragma: "no-cache" };
+  if (env.SUB_FETCH_PROXY_TOKEN) headers["x-proxy-token"] = env.SUB_FETCH_PROXY_TOKEN;
+  return headers;
 }
 
 function subscriptionRequestHeadersList(): HeadersInit[] {
