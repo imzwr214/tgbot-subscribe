@@ -652,14 +652,15 @@ async function handleCallback(callback: TelegramCallbackQuery, request: Request,
   }
 
   const cached = await getCachedSubscription(env, userId, action.cacheId);
-  if (!cached && action.name !== "refresh") {
+  if (!cached && !["refresh", "nodes", "collapse_nodes"].includes(action.name)) {
     await sendMessage(env, chatId, "缓存已过期，请重新发送订阅链接或使用 /sub。");
     return;
   }
 
+  const cachedUrl = await getCachedSubscriptionUrl(env, userId, action.cacheId);
+
   if (action.name === "refresh") {
     const saved = await getSavedSubscriptions(env, userId);
-    const cachedUrl = await getCachedSubscriptionUrl(env, userId, action.cacheId);
     const subUrl = cached?.url ?? cachedUrl ?? (saved.length === 1 ? saved[0].url : undefined);
     if (!subUrl) {
       await editCallbackMessage(env, callback, formatSubscriptionListText(saved), subscriptionListKeyboard(saved));
@@ -669,13 +670,23 @@ async function handleCallback(callback: TelegramCallbackQuery, request: Request,
     return;
   }
 
-  if (action.name === "nodes" && cached) {
-    await editCallbackMessage(env, callback, formatSubscriptionWithNodesMessage(cached), actionKeyboard(true, action.cacheId));
+  if (action.name === "nodes") {
+    const subUrl = cached?.url ?? cachedUrl;
+    if (!subUrl) {
+      await sendMessage(env, chatId, "缓存已过期，请重新发送订阅链接或使用 /sub。");
+      return;
+    }
+    await queryAndEdit(subUrl, userId, callback, env, action.cacheId, true);
     return;
   }
 
-  if (action.name === "collapse_nodes" && cached) {
-    await editCallbackMessage(env, callback, formatSubscriptionMessage(cached, cached.url), actionKeyboard(false, action.cacheId));
+  if (action.name === "collapse_nodes") {
+    const subUrl = cached?.url ?? cachedUrl;
+    if (!subUrl) {
+      await sendMessage(env, chatId, "缓存已过期，请重新发送订阅链接或使用 /sub。");
+      return;
+    }
+    await queryAndEdit(subUrl, userId, callback, env, action.cacheId, false);
     return;
   }
 
@@ -737,14 +748,16 @@ async function sendNodeResult(uri: string, userId: number, chatId: number, env: 
   await sendFormattedMessage(env, chatId, formatSingleNodeMessage(uri), nodeActionKeyboard(cacheId), replyToMessageId);
 }
 
-async function queryAndEdit(subUrl: string, userId: number, callback: TelegramCallbackQuery, env: Env, existingCacheId?: string): Promise<void> {
+async function queryAndEdit(subUrl: string, userId: number, callback: TelegramCallbackQuery, env: Env, existingCacheId?: string, nodesExpanded = false): Promise<void> {
   try {
     const result = await fetchAndParseSubscription(subUrl, env);
     const cacheId = existingCacheId ?? createCacheId();
-    await cacheSubscription(env, userId, { url: subUrl, updatedAt: new Date().toISOString(), ...result }, cacheId);
-    await editCallbackMessage(env, callback, formatSubscriptionMessage(result, subUrl), actionKeyboard(false, cacheId));
+    const cached = { url: subUrl, updatedAt: new Date().toISOString(), ...result };
+    await cacheSubscription(env, userId, cached, cacheId);
+    const message = nodesExpanded ? formatSubscriptionWithNodesMessage(cached) : formatSubscriptionMessage(result, subUrl);
+    await editCallbackMessage(env, callback, message, actionKeyboard(nodesExpanded, cacheId));
   } catch (error) {
-    await editCallbackMessage(env, callback, `订阅查询失败：${safeError(error)}`, actionKeyboard(false, existingCacheId));
+    await editCallbackMessage(env, callback, `订阅查询失败：${safeError(error)}`, actionKeyboard(nodesExpanded, existingCacheId));
   }
 }
 
