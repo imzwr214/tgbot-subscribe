@@ -100,6 +100,10 @@ interface SavedSubscriptionItem {
   createdAt: string;
   updatedAt: string;
   lastQueryAt?: string;
+  snapshotUpdatedAt?: string;
+  snapshotNodeCount?: number;
+  lastRefreshAttemptAt?: string;
+  lastRefreshError?: string;
 }
 
 interface ShortSubscription {
@@ -133,6 +137,7 @@ interface WebRequestBody {
   id?: string;
   token?: string;
   save?: boolean;
+  refresh?: boolean;
 }
 
 const CACHE_TTL_SECONDS = 60 * 30;
@@ -354,6 +359,32 @@ async function webQuerySavedSubscription(request: Request, env: Env): Promise<Re
     });
   }
 
+  if (body.refresh === true) {
+    try {
+      const result = await fetchAndParseSubscription(item.url, env);
+      if (result.nodes.length === 0) throw new Error("订阅未解析出节点，已保留旧快照");
+      const cached: CachedSubscription = { url: item.url, updatedAt: new Date().toISOString(), ...result };
+      await saveSubscription(env, userId, cached);
+      return json({ ok: true, result: webSubscriptionSummary(cached), saved: webSavedSubscriptionItem(item), subscriptions: webSavedSubscriptionItems(await getSavedSubscriptions(env, userId)) });
+    } catch (error) {
+      item.lastRefreshAttemptAt = new Date().toISOString();
+      item.lastRefreshError = safeError(error);
+      await putSavedSubscriptions(env, userId, subscriptions);
+      return json({ ok: false, error: `${item.lastRefreshError}；已保留旧快照` }, 502);
+    }
+  }
+
+  const snapshot = await getSavedSubscriptionSnapshot(env, userId, item.id);
+  if (!snapshot) return json({ ok: false, error: "该订阅尚无本地快照，请手动刷新后再查看" }, 409);
+  await touchSavedSubscriptionLastQueryAt(env, userId, item.id);
+  return json({
+    ok: true,
+    result: webSubscriptionSummary(snapshot),
+    saved: webSavedSubscriptionItem(item),
+    subscriptions: webSavedSubscriptionItems(await getSavedSubscriptions(env, userId))
+  });
+
+  /*
   try {
     const result = await fetchAndParseSubscription(item.url, env);
     await touchSavedSubscriptionLastQueryAt(env, userId, item.id);
@@ -366,6 +397,9 @@ async function webQuerySavedSubscription(request: Request, env: Env): Promise<Re
   } catch (error) {
     return json({ ok: false, error: safeError(error) }, 502);
   }
+}
+
+*/
 }
 
 async function webDeleteSavedSubscription(request: Request, env: Env): Promise<Response> {
@@ -423,7 +457,11 @@ function webSavedSubscriptionItem(item: SavedSubscriptionItem) {
     name: item.name,
     airportName: item.airportName,
     updatedAt: item.updatedAt,
-    lastQueryAt: item.lastQueryAt
+    lastQueryAt: item.lastQueryAt,
+    snapshotUpdatedAt: item.snapshotUpdatedAt,
+    snapshotNodeCount: item.snapshotNodeCount,
+    lastRefreshAttemptAt: item.lastRefreshAttemptAt,
+    lastRefreshError: item.lastRefreshError
   };
 }
 
@@ -630,6 +668,16 @@ async function handleCallback(callback: TelegramCallbackQuery, request: Request,
     return;
   }
 
+  if (action.name === "refresh_saved" && action.subId) {
+    await refreshSavedSubscription(action.subId, userId, callback, env);
+    return;
+  }
+
+  if (["nodes_saved", "collapse_nodes_saved"].includes(action.name) && action.subId) {
+    await showSavedSubscriptionSnapshot(action.subId, userId, callback, env, action.name === "nodes_saved");
+    return;
+  }
+
   if (action.name === "delete_saved" && action.subId) {
     await confirmDeleteSavedSubscription(action.subId, userId, callback, env);
     return;
@@ -776,6 +824,12 @@ function formatSubscriptionListText(subscriptions: SavedSubscriptionItem[]): str
     const updatedAt = item.updatedAt.slice(0, 10);
     const kindLabel = savedItemKind(item) === "node" ? "节点" : "订阅";
     lines.push(`${index + 1}. [${kindLabel}] ${item.name}（更新：${updatedAt}）`);
+    if (savedItemKind(item) === "subscription") {
+      const snapshotInfo = item.snapshotUpdatedAt
+        ? `快照：${item.snapshotNodeCount ?? 0} 节点 / ${item.snapshotUpdatedAt.slice(0, 10)}`
+        : "快照：尚未生成";
+      lines.push(`   ${snapshotInfo}${item.lastRefreshError ? " / 最近刷新失败，已保留快照" : ""}`);
+    }
   }
   return lines.join("\n");
 }
@@ -809,6 +863,10 @@ async function querySavedSubscription(subId: string, userId: number, callback: T
     return;
   }
 
+  await showSavedSubscriptionSnapshot(subId, userId, callback, env, false);
+  return;
+
+  /*
   try {
     const result = await fetchAndParseSubscription(item.url, env);
     const cacheId = createCacheId();
@@ -817,6 +875,59 @@ async function querySavedSubscription(subId: string, userId: number, callback: T
     await editCallbackMessage(env, callback, formatSubscriptionMessage(result, item.url), actionKeyboard(false, cacheId, true));
   } catch (error) {
     await editCallbackMessage(env, callback, `订阅查询失败：${safeError(error)}`, subscriptionListKeyboard(subscriptions));
+  }
+}
+
+*/
+}
+
+async function showSavedSubscriptionSnapshot(subId: string, userId: number, callback: TelegramCallbackQuery, env: Env, nodesExpanded: boolean): Promise<void> {
+  const subscriptions = await getSavedSubscriptions(env, userId);
+  const item = subscriptions.find((subscription) => subscription.id === subId);
+  if (!item || savedItemKind(item) !== "subscription") {
+    await editCallbackMessage(env, callback, formatSubscriptionListText(subscriptions), subscriptionListKeyboard(subscriptions));
+    return;
+  }
+  const snapshot = await getSavedSubscriptionSnapshot(env, userId, subId);
+  if (!snapshot) {
+    await editCallbackMessage(env, callback, "该订阅是旧保存记录，尚未保存本地快照。请点击“手动刷新订阅”生成快照。", savedSubscriptionKeyboard(subId, false));
+    return;
+  }
+  await touchSavedSubscriptionLastQueryAt(env, userId, subId);
+  const cacheId = createCacheId();
+  await cacheSubscription(env, userId, snapshot, cacheId);
+  const message = nodesExpanded ? formatSubscriptionWithNodesMessage(snapshot) : formatSubscriptionMessage(snapshot, snapshot.url);
+  await editCallbackMessage(env, callback, message, savedSubscriptionKeyboard(subId, nodesExpanded, cacheId));
+}
+
+async function refreshSavedSubscription(subId: string, userId: number, callback: TelegramCallbackQuery, env: Env): Promise<void> {
+  const subscriptions = await getSavedSubscriptions(env, userId);
+  const item = subscriptions.find((subscription) => subscription.id === subId);
+  if (!item || savedItemKind(item) !== "subscription") {
+    await editCallbackMessage(env, callback, formatSubscriptionListText(subscriptions), subscriptionListKeyboard(subscriptions));
+    return;
+  }
+  item.lastRefreshAttemptAt = new Date().toISOString();
+  try {
+    const result = await fetchAndParseSubscription(item.url, env);
+    if (result.nodes.length === 0) throw new Error("订阅未解析出节点，已保留旧快照");
+    const cached: CachedSubscription = { url: item.url, updatedAt: new Date().toISOString(), ...result };
+    await saveSubscription(env, userId, cached);
+    const latestSubscriptions = await getSavedSubscriptions(env, userId);
+    const latestItem = latestSubscriptions.find((subscription) => subscription.id === subId);
+    if (latestItem) {
+      latestItem.lastRefreshAttemptAt = item.lastRefreshAttemptAt;
+      await putSavedSubscriptions(env, userId, latestSubscriptions);
+    }
+    const cacheId = createCacheId();
+    await cacheSubscription(env, userId, cached, cacheId);
+    await editCallbackMessage(env, callback, formatSubscriptionMessage(cached, cached.url), savedSubscriptionKeyboard(subId, false, cacheId));
+  } catch (error) {
+    item.lastRefreshError = safeError(error);
+    await putSavedSubscriptions(env, userId, subscriptions);
+    const snapshot = await getSavedSubscriptionSnapshot(env, userId, subId);
+    const prefix = `刷新失败：${item.lastRefreshError}\n已保留上一次成功快照。\n\n`;
+    await editCallbackMessage(env, callback, snapshot ? prependText(formatSubscriptionMessage(snapshot, snapshot.url), prefix) : `${prefix}请稍后重试。`, savedSubscriptionKeyboard(subId, false));
   }
 }
 
@@ -1330,6 +1441,26 @@ function actionKeyboard(nodesExpanded = false, cacheId?: string, backToList = fa
   };
 }
 
+function savedSubscriptionKeyboard(subId: string, nodesExpanded: boolean, cacheId?: string) {
+  const callback = (name: string) => cacheId ? `${name}:${cacheId}` : name;
+  return {
+    inline_keyboard: [
+      [
+        { text: "🔄 手动刷新订阅", callback_data: `refresh_saved:${subId}` },
+        nodesExpanded
+          ? { text: "📋 折叠全部节点", callback_data: `collapse_nodes_saved:${subId}` }
+          : { text: "📋 显示全部节点", callback_data: `nodes_saved:${subId}` }
+      ],
+      [
+        { text: "📄 导出Base64", callback_data: callback("export_base64") },
+        { text: "📄 导出原始订阅", callback_data: callback("export_yaml") }
+      ],
+      [{ text: "🔗 生成短链", callback_data: callback("short_link") }],
+      [{ text: "⬅️ 返回保存列表", callback_data: "cancel" }]
+    ]
+  };
+}
+
 function nodeActionKeyboard(cacheId?: string, backToList = false) {
   const inlineKeyboard = [
     [{ text: "保存节点", callback_data: cacheId ? `save_node:${cacheId}` : "save_node" }]
@@ -1498,6 +1629,10 @@ function trimFormattedText(message: FormattedText): FormattedText {
       .filter((entity) => entity.length > 0);
   }
   return message;
+}
+
+function prependText(message: FormattedText, prefix: string): FormattedText {
+  return { text: prefix + message.text, entities: message.entities.map((entity) => ({ ...entity, offset: entity.offset + prefix.length })) };
 }
 
 function clipFormattedText(message: FormattedText, maxLength: number): FormattedText {
@@ -1670,6 +1805,11 @@ async function saveSubscription(env: Env, userId: number, cached: CachedSubscrip
     existing.name = savedSubscriptionName(cached);
     existing.airportName = cached.airportName;
     existing.updatedAt = now;
+    existing.snapshotUpdatedAt = cached.updatedAt;
+    existing.snapshotNodeCount = getUsableNodes(cached.nodes).length;
+    existing.lastRefreshAttemptAt = now;
+    existing.lastRefreshError = undefined;
+    await putSavedSubscriptionSnapshot(env, userId, existing.id, cached);
     await putSavedSubscriptions(env, userId, subscriptions);
     return existing;
   }
@@ -1681,11 +1821,27 @@ async function saveSubscription(env: Env, userId: number, cached: CachedSubscrip
     url: cached.url,
     airportName: cached.airportName,
     createdAt: now,
-    updatedAt: now
+    updatedAt: now,
+    snapshotUpdatedAt: cached.updatedAt,
+    snapshotNodeCount: getUsableNodes(cached.nodes).length,
+    lastRefreshAttemptAt: now
   };
   subscriptions.push(item);
+  await putSavedSubscriptionSnapshot(env, userId, item.id, cached);
   await putSavedSubscriptions(env, userId, subscriptions);
   return item;
+}
+
+function savedSubscriptionSnapshotKey(userId: number, subId: string): string {
+  return `user:${userId}:subscription-snapshot:${subId}`;
+}
+
+async function getSavedSubscriptionSnapshot(env: Env, userId: number, subId: string): Promise<CachedSubscription | null> {
+  return env.SUB_KV.get<CachedSubscription>(savedSubscriptionSnapshotKey(userId, subId), "json");
+}
+
+async function putSavedSubscriptionSnapshot(env: Env, userId: number, subId: string, snapshot: CachedSubscription): Promise<void> {
+  await env.SUB_KV.put(savedSubscriptionSnapshotKey(userId, subId), JSON.stringify(snapshot));
 }
 
 async function saveNode(env: Env, userId: number, cached: CachedNode): Promise<SavedSubscriptionItem> {
@@ -1798,7 +1954,7 @@ function parseCallbackAction(data: string): CallbackAction {
   if (data === "cancel") return { name: "cancel" };
 
   const [name, value] = data.split(":", 2);
-  if (["query_saved", "delete_saved", "confirm_delete_saved"].includes(name)) {
+  if (["query_saved", "delete_saved", "confirm_delete_saved", "refresh_saved", "nodes_saved", "collapse_nodes_saved"].includes(name)) {
     return { name, subId: value && /^[a-f0-9]{12}$/i.test(value) ? value : undefined };
   }
 
@@ -2525,6 +2681,7 @@ function webAppHtml(): string {
           '<div class="saved-meta">' + escapeHtml(item.kind) + ' / 更新 ' + escapeHtml(String(item.updatedAt || "").slice(0, 10)) + '</div>' +
           '<div class="saved-actions">' +
           '<button type="button" data-query="' + escapeHtml(item.id) + '">查询</button>' +
+          (item.kind === "subscription" ? '<button type="button" data-refresh="' + escapeHtml(item.id) + '">手动刷新</button>' : '') +
           '<button class="danger" type="button" data-delete="' + escapeHtml(item.id) + '">删除</button>' +
           '</div>' +
           '</div>';
@@ -2570,14 +2727,15 @@ function webAppHtml(): string {
       const button = event.target.closest("button");
       if (!button) return;
       const queryId = button.getAttribute("data-query");
+      const refreshId = button.getAttribute("data-refresh");
       const deleteId = button.getAttribute("data-delete");
       setBusy(true);
-      setStatus(queryId ? "查询中..." : "删除中...");
+      setStatus(queryId ? "查询中..." : refreshId ? "手动刷新中..." : "删除中...");
       try {
-        const payload = await api(queryId ? "/web/query-saved" : "/web/delete-saved", { id: queryId || deleteId });
+        const payload = await api(queryId || refreshId ? "/web/query-saved" : "/web/delete-saved", { id: queryId || refreshId || deleteId, refresh: Boolean(refreshId) });
         renderResult(payload);
         renderSaved(payload.subscriptions);
-        setStatus(queryId ? "查询完成" : "已删除", "ok");
+        setStatus(queryId ? "查询完成" : refreshId ? "刷新完成" : "已删除", "ok");
       } catch (error) {
         setStatus(error.message, "error");
       } finally {
