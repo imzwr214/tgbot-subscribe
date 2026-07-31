@@ -237,6 +237,36 @@ export function generateMihomoSubscription(raw: string): string {
   return `${stringify(config, { indent: 2, lineWidth: 0 }).trimEnd()}\n`;
 }
 
+export function generateMihomoSubscriptionFromProvider(providerUrl: string): string {
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(providerUrl);
+  } catch {
+    throw new MihomoExportError("节点合集订阅链接无效");
+  }
+  if (!["http:", "https:"].includes(parsedUrl.protocol)) {
+    throw new MihomoExportError("节点合集订阅链接必须使用 HTTP 或 HTTPS");
+  }
+  const providerId = parsedUrl.pathname.split("/").filter(Boolean).at(-1)?.replace(/[^a-z0-9_-]/gi, "").slice(0, 32) || "default";
+
+  return generateMihomoSubscription(stringify({
+    "proxy-providers": {
+      "节点合集": {
+        type: "http",
+        url: parsedUrl.toString(),
+        path: `./proxy_providers/tgsub-node-collection-${providerId}.yaml`,
+        interval: 86400,
+        "health-check": {
+          enable: true,
+          url: HEALTH_CHECK_URL,
+          interval: HEALTH_CHECK_INTERVAL,
+          lazy: true
+        }
+      }
+    }
+  }, { indent: 2, lineWidth: 0 }));
+}
+
 function buildProxyGroups(): MihomoGroup[] {
   const regionNames = REGION_DEFINITIONS.map((region) => region.name);
   const sharedSelectProxies = ["选择代理", ...regionNames, "手动选择", "直连"];

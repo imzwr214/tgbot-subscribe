@@ -1,4 +1,4 @@
-import { generateMihomoSubscription, MihomoExportError } from "./mihomo/generate";
+import { generateMihomoSubscription, generateMihomoSubscriptionFromProvider, MihomoExportError } from "./mihomo/generate";
 
 interface Env {
   BOT_TOKEN: string;
@@ -73,7 +73,8 @@ interface ParsedSubscription {
 
 type QueryInput =
   | { kind: "subscription"; url: string }
-  | { kind: "node"; uri: string };
+  | { kind: "node"; uri: string }
+  | { kind: "nodes"; uris: string[] };
 
 interface CachedSubscription extends ParsedSubscription {
   url: string;
@@ -85,6 +86,11 @@ interface CachedNode {
   name: string;
   protocol: string;
   region: string;
+  updatedAt: string;
+}
+
+interface CachedNodeBundle {
+  nodes: CachedNode[];
   updatedAt: string;
 }
 
@@ -123,6 +129,15 @@ type ShortSubscription =
       kind: "node";
       uri: string;
       format: "base64";
+    })
+  | (ShortLinkBase & {
+      kind: "node-collection";
+      format: "base64";
+    })
+  | (ShortLinkBase & {
+      kind: "node-collection";
+      format: "mihomo";
+      base64ShortId: string;
     });
 
 interface TelegramMessageEntity {
@@ -218,11 +233,11 @@ export default {
       }
 
       if (request.method === "GET" && url.pathname.startsWith("/s/")) {
-        return exportShortLink(url.pathname.slice(3), env);
+        return exportShortLink(url.pathname.slice(3), env, url.origin);
       }
 
       if (request.method === "GET" && url.pathname.startsWith("/m/")) {
-        return exportShortLink(url.pathname.slice(3), env);
+        return exportShortLink(url.pathname.slice(3), env, url.origin);
       }
 
       if (request.method === "POST" && url.pathname === "/telegram/webhook") {
@@ -278,8 +293,8 @@ async function setupBotCommands(env: Env): Promise<{ defaultCommands: boolean; a
 function botCommands(): Array<{ command: string; description: string }> {
   return [
     { command: "whoami", description: "查看自己的 Telegram user id" },
-    { command: "query", description: "群聊查询：/query 订阅链接" },
-    { command: "sub", description: "查看自己的订阅列表" },
+    { command: "query", description: "查询订阅或批量添加节点" },
+    { command: "sub", description: "管理订阅与节点合集" },
     { command: "help", description: "查看帮助" }
   ];
 }
@@ -654,6 +669,11 @@ async function handleMessage(message: TelegramMessage, request: Request, env: En
     return;
   }
 
+  if (input.kind === "nodes") {
+    await sendNodeBundleResult(input.uris, userId, message.chat.id, env, message.message_id);
+    return;
+  }
+
   await queryAndSend(input.url, userId, message.chat.id, env, message.message_id);
 }
 
@@ -722,7 +742,82 @@ async function handleCallback(callback: TelegramCallbackQuery, request: Request,
       return;
     }
     const saved = await saveNode(env, userId, cachedNode);
-    await sendMessage(env, chatId, `已保存节点：${saved.name}\n以后发送 /sub 可以查看自己的保存列表。`);
+    const nodeCount = await getSavedNodeCount(env, userId);
+    await sendMessage(
+      env,
+      chatId,
+      `已加入节点合集：${saved.name}\n当前合集共 ${nodeCount} 个节点。`,
+      nodeCollectionKeyboard(nodeCount, true)
+    );
+    return;
+  }
+
+  if (action.name === "save_nodes") {
+    const cachedBundle = await getCachedNodeBundle(env, userId, action.cacheId);
+    if (!cachedBundle) {
+      await sendMessage(env, chatId, "节点批量缓存已过期，请重新发送节点链接。");
+      return;
+    }
+    const result = await saveNodes(env, userId, cachedBundle.nodes);
+    await sendMessage(
+      env,
+      chatId,
+      `节点合集已更新：新增 ${result.added} 个，当前共 ${result.total} 个节点。`,
+      nodeCollectionKeyboard(result.total, true)
+    );
+    return;
+  }
+
+  if (action.name === "merge_nodes") {
+    const uris = await getSavedNodeUris(env, userId);
+    if (uris.length === 0) {
+      await sendMessage(env, chatId, "节点合集还是空的，请先发送节点链接并加入合集。");
+      return;
+    }
+    const shortId = await createNodeCollectionShortLink(env, userId, "base64");
+    const origin = new URL(request.url).origin;
+    const validDays = Math.floor(SHORT_LINK_TTL_SECONDS / (60 * 60 * 24));
+    await editCallbackMessage(
+      env,
+      callback,
+      `合并节点订阅已生成（${uris.length} 个节点，${validDays} 天有效）：\n${origin}/s/${shortId}\n\n以后新增或删除节点时，这条链接会自动跟着更新。\n链接内含全部节点凭据，请勿公开分享。`,
+      nodeCollectionKeyboard(uris.length, true)
+    );
+    return;
+  }
+
+  if (action.name === "mihomo_nodes") {
+    const uris = await getSavedNodeUris(env, userId);
+    if (uris.length === 0) {
+      await sendMessage(env, chatId, "节点合集还是空的，请先发送节点链接并加入合集。");
+      return;
+    }
+    try {
+      const origin = new URL(request.url).origin;
+      const base64ShortId = await createNodeCollectionShortLink(env, userId, "base64");
+      const body = generateMihomoSubscriptionFromProvider(`${origin}/s/${base64ShortId}`);
+      const shortId = await createNodeCollectionShortLink(env, userId, "mihomo", base64ShortId);
+      const validDays = Math.floor(SHORT_LINK_TTL_SECONDS / (60 * 60 * 24));
+      await sendTextDocument(env, chatId, "node-collection-Mihomo.yaml", body, `节点合集 Mihomo 配置已生成（${uris.length} 个节点）`);
+      await editCallbackMessage(
+        env,
+        callback,
+        `节点合集 Mihomo 配置与订阅链接已生成（${validDays} 天有效）：\n${origin}/m/${shortId}\n\n合集节点变动后，这条链接会自动更新。\n链接内含全部节点凭据，请勿公开分享。`,
+        nodeCollectionKeyboard(uris.length, true)
+      );
+    } catch (error) {
+      await sendMessage(env, chatId, mihomoExportErrorMessage(error));
+    }
+    return;
+  }
+
+  if (action.name === "short_node") {
+    const cachedNode = await getCachedNode(env, userId, action.cacheId);
+    if (!cachedNode) {
+      await sendMessage(env, chatId, "节点缓存已过期，请重新发送节点链接。");
+      return;
+    }
+    await sendNodeSubscriptionLink(env, userId, chatId, new URL(request.url).origin, cachedNode.uri);
     return;
   }
 
@@ -752,16 +847,6 @@ async function handleCallback(callback: TelegramCallbackQuery, request: Request,
       return;
     }
     await queryAndEdit(subUrl, userId, callback, env, action.cacheId, true);
-    return;
-  }
-
-  if (action.name === "short_node") {
-    const cachedNode = await getCachedNode(env, userId, action.cacheId);
-    if (!cachedNode) {
-      await sendMessage(env, chatId, "节点缓存已过期，请重新发送节点链接。");
-      return;
-    }
-    await sendNodeSubscriptionLink(env, userId, chatId, new URL(request.url).origin, cachedNode.uri);
     return;
   }
 
@@ -851,6 +936,45 @@ async function sendNodeResult(uri: string, userId: number, chatId: number, env: 
   await sendFormattedMessage(env, chatId, formatSingleNodeMessage(uri), nodeActionKeyboard(cacheId), replyToMessageId);
 }
 
+async function sendNodeBundleResult(uris: string[], userId: number, chatId: number, env: Env, replyToMessageId?: number): Promise<void> {
+  const parsedNodes = dedupeNodeUris(uris)
+    .map((uri) => ({ uri, node: parseNodeLines([uri])[0] }))
+    .filter((entry): entry is { uri: string; node: ParsedNode } => Boolean(entry.node));
+  if (parsedNodes.length === 0) {
+    await sendMessage(env, chatId, "未解析到可用节点链接。", undefined, replyToMessageId);
+    return;
+  }
+  if (parsedNodes.length === 1) {
+    await sendNodeResult(parsedNodes[0].uri, userId, chatId, env, replyToMessageId);
+    return;
+  }
+
+  const cacheId = createCacheId();
+  const updatedAt = new Date().toISOString();
+  const bundle: CachedNodeBundle = {
+    updatedAt,
+    nodes: parsedNodes.map(({ uri, node }) => ({
+      uri,
+      name: node.name,
+      protocol: node.protocol,
+      region: node.region,
+      updatedAt
+    }))
+  };
+  await cacheNodeBundle(env, userId, bundle, cacheId);
+  await sendMessage(env, chatId, formatNodeBundleMessage(bundle.nodes), nodeBundleKeyboard(cacheId), replyToMessageId);
+}
+
+function formatNodeBundleMessage(nodes: CachedNode[]): string {
+  const lines = [`已识别 ${nodes.length} 个节点：`];
+  for (const [index, node] of nodes.slice(0, 50).entries()) {
+    lines.push(`${index + 1}. ${cleanDisplayText(node.name)} (${node.protocol})`);
+  }
+  if (nodes.length > 50) lines.push(`还有 ${nodes.length - 50} 个节点未显示。`);
+  lines.push("", "点击下方按钮可一次全部加入你的节点合集。");
+  return lines.join("\n");
+}
+
 async function queryAndEdit(subUrl: string, userId: number, callback: TelegramCallbackQuery, env: Env, existingCacheId?: string, nodesExpanded = false): Promise<void> {
   try {
     const result = await fetchAndParseSubscription(subUrl, env);
@@ -874,7 +998,11 @@ function formatSubscriptionListText(subscriptions: SavedSubscriptionItem[]): str
     return "还没有保存订阅或节点。请先发送链接，查询成功后点击保存。";
   }
 
+  const nodeCount = subscriptions.filter((item) => savedItemKind(item) === "node").length;
   const lines = ["你的保存列表："];
+  if (nodeCount > 0) {
+    lines.push(`节点合集：${nodeCount} 个节点（可合并成一条订阅）`, "");
+  }
   for (const [index, item] of subscriptions.entries()) {
     const updatedAt = item.updatedAt.slice(0, 10);
     const kindLabel = savedItemKind(item) === "node" ? "节点" : "订阅";
@@ -891,12 +1019,16 @@ function formatSubscriptionListText(subscriptions: SavedSubscriptionItem[]): str
 
 function subscriptionListKeyboard(subscriptions: SavedSubscriptionItem[]) {
   if (subscriptions.length === 0) return undefined;
-
+  const nodeCount = subscriptions.filter((item) => savedItemKind(item) === "node").length;
+  const collectionRows = nodeCount > 0 ? nodeCollectionKeyboard(nodeCount).inline_keyboard : [];
   return {
-    inline_keyboard: subscriptions.map((item) => [
-      { text: savedItemButtonText(item), callback_data: `query_saved:${item.id}` },
-      { text: "删除", callback_data: `delete_saved:${item.id}` }
-    ])
+    inline_keyboard: [
+      ...collectionRows,
+      ...subscriptions.map((item) => [
+        { text: savedItemButtonText(item), callback_data: `query_saved:${item.id}` },
+        { text: "删除", callback_data: `delete_saved:${item.id}` }
+      ])
+    ]
   };
 }
 
@@ -1524,11 +1656,15 @@ function nodeActionKeyboard(cacheId?: string, backToList = false, savedNodeId?: 
   const inlineKeyboard: Array<Array<{ text: string; callback_data: string }>> = [];
   if (cacheId) {
     inlineKeyboard.push([
-      { text: "保存节点", callback_data: `save_node:${cacheId}` },
-      { text: "🔗 获取订阅链接", callback_data: `short_node:${cacheId}` }
+      { text: "➕ 加入节点合集", callback_data: `save_node:${cacheId}` },
+      { text: "🔗 单节点订阅", callback_data: `short_node:${cacheId}` }
     ]);
   } else if (savedNodeId) {
-    inlineKeyboard.push([{ text: "🔗 获取订阅链接", callback_data: `short_saved_node:${savedNodeId}` }]);
+    inlineKeyboard.push([
+      { text: "🔗 合并全部节点", callback_data: "merge_nodes" },
+      { text: "⚙️ 合集Mihomo", callback_data: "mihomo_nodes" }
+    ]);
+    inlineKeyboard.push([{ text: "🔗 仅这个节点", callback_data: `short_saved_node:${savedNodeId}` }]);
   }
   if (backToList) {
     inlineKeyboard.push([{ text: "↩️ 返回保存列表", callback_data: "cancel" }]);
@@ -1536,6 +1672,21 @@ function nodeActionKeyboard(cacheId?: string, backToList = false, savedNodeId?: 
   return {
     inline_keyboard: inlineKeyboard
   };
+}
+
+function nodeBundleKeyboard(cacheId: string) {
+  return {
+    inline_keyboard: [[{ text: "➕ 全部加入节点合集", callback_data: `save_nodes:${cacheId}` }]]
+  };
+}
+
+function nodeCollectionKeyboard(nodeCount: number, backToList = false) {
+  const inlineKeyboard = [[
+    { text: `🔗 合并订阅 (${nodeCount})`, callback_data: "merge_nodes" },
+    { text: "⚙️ 合集Mihomo", callback_data: "mihomo_nodes" }
+  ]];
+  if (backToList) inlineKeyboard.push([{ text: "⬅️ 返回保存列表", callback_data: "cancel" }]);
+  return { inline_keyboard: inlineKeyboard };
 }
 
 function mainKeyboard() {
@@ -1561,11 +1712,12 @@ function mainKeyboardV2() {
 function helpTextV2(): string {
   return [
     "发送订阅链接，我会查询流量、过期时间和节点列表。",
+    "也可以一次发送多条节点链接，全部加入合集后生成合并订阅或 Mihomo 配置。",
     "",
     "可用命令：",
     "/whoami 查看自己的 Telegram user id",
-    "/query <订阅链接> 群聊里查询订阅",
-    "/sub 查看自己的订阅列表",
+    "/query <订阅或节点链接> 群聊里查询",
+    "/sub 管理订阅与节点合集",
     "/users 管理员查看授权用户",
     "/allow <userId> 管理员授权用户",
     "/revoke <userId> 管理员取消授权用户",
@@ -1934,6 +2086,41 @@ async function saveNode(env: Env, userId: number, cached: CachedNode): Promise<S
   return item;
 }
 
+async function saveNodes(env: Env, userId: number, cachedNodes: CachedNode[]): Promise<{ added: number; total: number }> {
+  const subscriptions = await getSavedSubscriptions(env, userId);
+  const existingUris = new Set(subscriptions.filter((item) => savedItemKind(item) === "node").map((item) => item.url));
+  const now = new Date().toISOString();
+  let added = 0;
+  for (const cached of cachedNodes) {
+    if (existingUris.has(cached.uri)) continue;
+    subscriptions.push({
+      id: createSubscriptionId(),
+      kind: "node",
+      name: cached.name,
+      url: cached.uri,
+      createdAt: now,
+      updatedAt: now
+    });
+    existingUris.add(cached.uri);
+    added += 1;
+  }
+  if (added > 0) await putSavedSubscriptions(env, userId, subscriptions);
+  return { added, total: existingUris.size };
+}
+
+async function getSavedNodeUris(env: Env, userId: number): Promise<string[]> {
+  const subscriptions = await getSavedSubscriptions(env, userId);
+  return dedupeNodeUris(
+    subscriptions
+      .filter((item) => savedItemKind(item) === "node")
+      .map((item) => item.url)
+  );
+}
+
+async function getSavedNodeCount(env: Env, userId: number): Promise<number> {
+  return (await getSavedNodeUris(env, userId)).length;
+}
+
 async function putSavedSubscriptions(env: Env, userId: number, subscriptions: SavedSubscriptionItem[]): Promise<void> {
   await env.SUB_KV.put(savedSubscriptionsKey(userId), JSON.stringify(subscriptions));
 }
@@ -2007,6 +2194,15 @@ async function cacheNode(env: Env, userId: number, cached: CachedNode, cacheId: 
   await env.SUB_KV.put(`cache:node:${userId}:${cacheId}`, JSON.stringify(cached), { expirationTtl: CACHE_TTL_SECONDS });
 }
 
+async function getCachedNodeBundle(env: Env, userId: number, cacheId?: string): Promise<CachedNodeBundle | null> {
+  if (!cacheId) return null;
+  return env.SUB_KV.get(`cache:nodes:${userId}:${cacheId}`, "json");
+}
+
+async function cacheNodeBundle(env: Env, userId: number, cached: CachedNodeBundle, cacheId: string): Promise<void> {
+  await env.SUB_KV.put(`cache:nodes:${userId}:${cacheId}`, JSON.stringify(cached), { expirationTtl: CACHE_TTL_SECONDS });
+}
+
 function createCacheId(): string {
   return crypto.randomUUID().replace(/-/g, "").slice(0, 12);
 }
@@ -2046,6 +2242,16 @@ async function createNodeShortLink(env: Env, userId: number, uri: string): Promi
   return shortId;
 }
 
+async function createNodeCollectionShortLink(env: Env, userId: number, format: "base64" | "mihomo", base64ShortId?: string): Promise<string> {
+  const shortId = crypto.randomUUID().replace(/-/g, "").slice(0, 10);
+  if (format === "mihomo" && !base64ShortId) throw new Error("Mihomo 节点合集缺少 Base64 订阅引用");
+  const payload: ShortSubscription = format === "mihomo"
+    ? { kind: "node-collection", format, base64ShortId: base64ShortId!, createdBy: userId, createdAt: new Date().toISOString() }
+    : { kind: "node-collection", format, createdBy: userId, createdAt: new Date().toISOString() };
+  await env.SUB_KV.put(`short:${shortId}`, JSON.stringify(payload), { expirationTtl: SHORT_LINK_TTL_SECONDS });
+  return shortId;
+}
+
 async function sendNodeSubscriptionLink(env: Env, userId: number, chatId: number, origin: string, uri: string): Promise<void> {
   const shortId = await createNodeShortLink(env, userId, uri);
   const validDays = Math.floor(SHORT_LINK_TTL_SECONDS / (60 * 60 * 24));
@@ -2056,7 +2262,7 @@ async function sendNodeSubscriptionLink(env: Env, userId: number, chatId: number
   );
 }
 
-async function exportShortLink(shortId: string, env: Env): Promise<Response> {
+async function exportShortLink(shortId: string, env: Env, origin: string): Promise<Response> {
   if (!/^[a-z0-9]{10}$/i.test(shortId)) return new Response("Invalid short link", { status: 400 });
   const short = await env.SUB_KV.get<ShortSubscription>(`short:${shortId}`, "json");
   if (!short) return new Response("Short link not found or expired", { status: 404 });
@@ -2066,6 +2272,26 @@ async function exportShortLink(shortId: string, env: Env): Promise<Response> {
     return new Response(encodeUtf8Base64(short.uri.trim()), {
       headers: {
         "Content-Type": "text/plain; charset=utf-8",
+        "Profile-Update-Interval": "24"
+      }
+    });
+  }
+
+  if (short.kind === "node-collection") {
+    const uris = await getSavedNodeUris(env, short.createdBy);
+    if (uris.length === 0) return new Response("Node collection is empty", { status: 404 });
+    let body: string;
+    try {
+      body = short.format === "mihomo"
+        ? generateMihomoSubscriptionFromProvider(`${origin}/s/${short.base64ShortId}`)
+        : encodeUtf8Base64(uris.join("\n"));
+    } catch (error) {
+      if (error instanceof MihomoExportError) return new Response(error.message, { status: 422 });
+      throw error;
+    }
+    return new Response(body, {
+      headers: {
+        "Content-Type": short.format === "mihomo" ? "text/yaml; charset=utf-8" : "text/plain; charset=utf-8",
         "Profile-Update-Interval": "24"
       }
     });
@@ -2102,7 +2328,7 @@ function encodeUtf8Base64(value: string): string {
 
 function mihomoExportErrorMessage(error: unknown): string {
   const detail = error instanceof MihomoExportError ? error.message : safeError(error);
-  return `Mihomo 导出失败：${detail}\n\n当前版本只支持包含 proxies 或 proxy-providers 的标准 Clash/Mihomo YAML；Base64 和纯文本节点订阅暂不转换。`;
+  return `Mihomo 导出失败：${detail}\n\n机场订阅导出需要标准 Clash/Mihomo YAML；手动节点合集会通过 Mihomo proxy-provider 读取 URI/Base64 订阅。`;
 }
 
 async function isAllowedUser(userId: number, env: Env): Promise<boolean> {
@@ -2223,8 +2449,9 @@ function sortUserIds(ids: Iterable<string>): string[] {
 }
 
 function extractQueryInput(text: string): QueryInput | null {
-  const node = extractNodeUri(text);
-  if (node) return { kind: "node", uri: node };
+  const nodes = extractNodeUris(text);
+  if (nodes.length === 1) return { kind: "node", uri: nodes[0] };
+  if (nodes.length > 1) return { kind: "nodes", uris: nodes };
 
   const url = extractHttpUrl(text);
   if (url) return { kind: "subscription", url };
@@ -2242,9 +2469,14 @@ function extractHttpUrl(text: string): string | null {
   }
 }
 
-function extractNodeUri(text: string): string | null {
-  const match = text.match(/\b(?:vless|vmess|ss|ssr|trojan|hysteria2|hy2|tuic|anytls):\/\/[^\s<>"']+/i);
-  return match?.[0] ?? null;
+function extractNodeUris(text: string): string[] {
+  return dedupeNodeUris(
+    text.match(/\b(?:vless|vmess|ss|ssr|trojan|hysteria2|hy2|tuic|anytls):\/\/[^\s<>"']+/gi) ?? []
+  );
+}
+
+function dedupeNodeUris(uris: string[]): string[] {
+  return [...new Set(uris.map((uri) => uri.trim()).filter(Boolean))];
 }
 
 function formatSubscriptionHttpError(status: number, viaProxy = false): string {
