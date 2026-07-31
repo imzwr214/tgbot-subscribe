@@ -768,25 +768,7 @@ async function handleCallback(callback: TelegramCallbackQuery, request: Request,
     return;
   }
 
-  if (action.name === "merge_nodes") {
-    const uris = await getSavedNodeUris(env, userId);
-    if (uris.length === 0) {
-      await sendMessage(env, chatId, "节点合集还是空的，请先发送节点链接并加入合集。");
-      return;
-    }
-    const shortId = await createNodeCollectionShortLink(env, userId, "base64");
-    const origin = new URL(request.url).origin;
-    const validDays = Math.floor(SHORT_LINK_TTL_SECONDS / (60 * 60 * 24));
-    await editCallbackMessage(
-      env,
-      callback,
-      `合并节点订阅已生成（${uris.length} 个节点，${validDays} 天有效）：\n${origin}/s/${shortId}\n\n以后新增或删除节点时，这条链接会自动跟着更新。\n链接内含全部节点凭据，请勿公开分享。`,
-      nodeCollectionKeyboard(uris.length, true)
-    );
-    return;
-  }
-
-  if (action.name === "mihomo_nodes") {
+  if (["export_node_collection", "merge_nodes", "mihomo_nodes"].includes(action.name)) {
     const uris = await getSavedNodeUris(env, userId);
     if (uris.length === 0) {
       await sendMessage(env, chatId, "节点合集还是空的，请先发送节点链接并加入合集。");
@@ -796,14 +778,13 @@ async function handleCallback(callback: TelegramCallbackQuery, request: Request,
       const origin = new URL(request.url).origin;
       const base64ShortId = await createNodeCollectionShortLink(env, userId, "base64");
       const body = generateMihomoSubscriptionFromProvider(`${origin}/s/${base64ShortId}`);
-      const shortId = await createNodeCollectionShortLink(env, userId, "mihomo", base64ShortId);
+      const mihomoShortId = await createNodeCollectionShortLink(env, userId, "mihomo", base64ShortId);
       const validDays = Math.floor(SHORT_LINK_TTL_SECONDS / (60 * 60 * 24));
       await sendTextDocument(env, chatId, "node-collection-Mihomo.yaml", body, `节点合集 Mihomo 配置已生成（${uris.length} 个节点）`);
-      await editCallbackMessage(
+      await sendMessage(
         env,
-        callback,
-        `节点合集 Mihomo 配置与订阅链接已生成（${validDays} 天有效）：\n${origin}/m/${shortId}\n\n合集节点变动后，这条链接会自动更新。\n链接内含全部节点凭据，请勿公开分享。`,
-        nodeCollectionKeyboard(uris.length, true)
+        chatId,
+        `节点合集订阅已生成（${uris.length} 个节点，${validDays} 天有效）：\n\n通用订阅：\n${origin}/s/${base64ShortId}\n\nMihomo 订阅：\n${origin}/m/${mihomoShortId}\n\n合集节点变动后，两条链接都会自动更新。\n链接内含全部节点凭据，请勿公开分享。`
       );
     } catch (error) {
       await sendMessage(env, chatId, mihomoExportErrorMessage(error));
@@ -1660,10 +1641,7 @@ function nodeActionKeyboard(cacheId?: string, backToList = false, savedNodeId?: 
       { text: "🔗 单节点订阅", callback_data: `short_node:${cacheId}` }
     ]);
   } else if (savedNodeId) {
-    inlineKeyboard.push([
-      { text: "🔗 合并全部节点", callback_data: "merge_nodes" },
-      { text: "⚙️ 合集Mihomo", callback_data: "mihomo_nodes" }
-    ]);
+    inlineKeyboard.push([{ text: "🔗 生成合集订阅", callback_data: "export_node_collection" }]);
     inlineKeyboard.push([{ text: "🔗 仅这个节点", callback_data: `short_saved_node:${savedNodeId}` }]);
   }
   if (backToList) {
@@ -1681,10 +1659,7 @@ function nodeBundleKeyboard(cacheId: string) {
 }
 
 function nodeCollectionKeyboard(nodeCount: number, backToList = false) {
-  const inlineKeyboard = [[
-    { text: `🔗 合并订阅 (${nodeCount})`, callback_data: "merge_nodes" },
-    { text: "⚙️ 合集Mihomo", callback_data: "mihomo_nodes" }
-  ]];
+  const inlineKeyboard = [[{ text: `🔗 生成合集订阅 (${nodeCount})`, callback_data: "export_node_collection" }]];
   if (backToList) inlineKeyboard.push([{ text: "⬅️ 返回保存列表", callback_data: "cancel" }]);
   return { inline_keyboard: inlineKeyboard };
 }
