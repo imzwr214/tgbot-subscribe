@@ -4,6 +4,7 @@ import { spawnSync } from "node:child_process";
 
 const sourceFiles = [
   "src/index.ts",
+  "src/mihomo/generate.ts",
   "wrangler.toml",
   "package.json",
   "package-lock.json",

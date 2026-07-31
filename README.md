@@ -24,7 +24,8 @@ npx wrangler secret put DEBUG_TOKEN
 - `GET /setup?token=xxx`: 校验 `SETUP_TOKEN` 后设置 Telegram webhook。
 - `POST /telegram/webhook`: Telegram webhook 入口。
 - `GET /debug/subscription?token=xxx&user_id=123&url=...`: 校验 `DEBUG_TOKEN` 和白名单用户后调试订阅解析。
-- `GET /s/:id`: 短链订阅导出。
+- `GET /s/:id`: Base64 短链订阅导出。
+- `GET /m/:id`: Mihomo YAML 短链订阅导出。
 - `GET /health`: 健康检查。
 
 ## Telegram 用法
@@ -41,12 +42,15 @@ npx wrangler secret put DEBUG_TOKEN
 - 显示全部节点 / 折叠全部节点
 - 导出 Base64
 - 导出原始订阅
+- 导出 Mihomo 配置
 - 生成短链
+- 生成 Mihomo 订阅链接
 - 保存订阅
 
 ## 注意
 
 - 导出原始订阅不是 Clash YAML 转换，只是把订阅服务器返回的原始内容发成文件。
+- Mihomo 导出目前只支持包含 `proxies` 或 `proxy-providers` 的标准 Clash/Mihomo YAML；Base64 和纯文本节点订阅会明确提示不支持，不会生成无效伪配置。
 - 消息格式只对订阅链接使用 `code` entity，统计内容先不用 `blockquote` entity。
 - `subscription-userinfo` 里的 `reset_day` / `resetDay` 优先用于展示流量重置日；没有该字段时，如果响应头提供 `x-subscription-start-at` / `x-subscription-purchased-at` / `x-subscription-created-at` 和过期时间，会按 30 天周期显示“预计重置”，否则显示 `未知`。
 - 不要提交 Bot Token、Debug Token、Setup Token 或真实私人订阅链接。

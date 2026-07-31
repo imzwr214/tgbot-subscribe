@@ -1,3 +1,5 @@
+import { generateMihomoSubscription, MihomoExportError } from "./mihomo/generate";
+
 interface Env {
   BOT_TOKEN: string;
   ADMIN_USER_IDS?: string;
@@ -108,7 +110,7 @@ interface SavedSubscriptionItem {
 
 interface ShortSubscription {
   url: string;
-  format: "base64" | "yaml";
+  format: "base64" | "yaml" | "mihomo";
   createdBy: number;
   createdAt: string;
 }
@@ -206,6 +208,10 @@ export default {
       }
 
       if (request.method === "GET" && url.pathname.startsWith("/s/")) {
+        return exportShortLink(url.pathname.slice(3), env);
+      }
+
+      if (request.method === "GET" && url.pathname.startsWith("/m/")) {
         return exportShortLink(url.pathname.slice(3), env);
       }
 
@@ -748,6 +754,16 @@ async function handleCallback(callback: TelegramCallbackQuery, request: Request,
     return;
   }
 
+  if (action.name === "export_mihomo" && cached) {
+    try {
+      const body = generateMihomoSubscription(cached.raw);
+      await sendTextDocument(env, chatId, mihomoSubscriptionFilename(cached), body, "Mihomo 配置已生成");
+    } catch (error) {
+      await sendMessage(env, chatId, mihomoExportErrorMessage(error));
+    }
+    return;
+  }
+
   if (action.name === "save" && cached) {
     const saved = await saveSubscription(env, userId, cached);
     await sendMessage(env, chatId, `已保存订阅：${saved.name}\n以后发送 /sub 可以查看自己的订阅列表。`);
@@ -758,6 +774,18 @@ async function handleCallback(callback: TelegramCallbackQuery, request: Request,
     const shortId = await createShortLink(env, userId, cached.url);
     const origin = new URL(request.url).origin;
     await editCallbackMessage(env, callback, `短链已生成：\n${origin}/s/${shortId}`, actionKeyboard(false, action.cacheId));
+    return;
+  }
+
+  if (action.name === "short_mihomo" && cached) {
+    try {
+      generateMihomoSubscription(cached.raw);
+      const shortId = await createShortLink(env, userId, cached.url, "mihomo");
+      const origin = new URL(request.url).origin;
+      await editCallbackMessage(env, callback, `Mihomo 订阅链接已生成：\n${origin}/m/${shortId}`, actionKeyboard(false, action.cacheId));
+    } catch (error) {
+      await sendMessage(env, chatId, mihomoExportErrorMessage(error));
+    }
     return;
   }
 
@@ -1407,6 +1435,10 @@ function rawSubscriptionFilename(cached: CachedSubscription): string {
   return "subscription.txt";
 }
 
+function mihomoSubscriptionFilename(cached: CachedSubscription): string {
+  return `${safeDocumentBasename(cached.airportName) || "subscription"}-Mihomo.yaml`;
+}
+
 function safeDocumentBasename(value: string): string {
   return value
     .replace(/[\\/:*?"<>|]/g, "_")
@@ -1428,10 +1460,12 @@ function actionKeyboard(nodesExpanded = false, cacheId?: string, backToList = fa
       { text: "📥 导出Base64", callback_data: callback("export_base64") },
       { text: "📥 导出原始订阅", callback_data: callback("export_yaml") }
     ],
+    [{ text: "⚙️ 导出Mihomo配置", callback_data: callback("export_mihomo") }],
     [
       { text: "🔗 生成短链", callback_data: callback("short_link") },
-      { text: "💾 保存订阅", callback_data: callback("save") }
-    ]
+      { text: "🔗 Mihomo短链", callback_data: callback("short_mihomo") }
+    ],
+    [{ text: "💾 保存订阅", callback_data: callback("save") }]
   ];
   if (backToList) {
     inlineKeyboard.push([{ text: "↩️ 返回保存列表", callback_data: "cancel" }]);
@@ -1455,7 +1489,11 @@ function savedSubscriptionKeyboard(subId: string, nodesExpanded: boolean, cacheI
         { text: "📄 导出Base64", callback_data: callback("export_base64") },
         { text: "📄 导出原始订阅", callback_data: callback("export_yaml") }
       ],
-      [{ text: "🔗 生成短链", callback_data: callback("short_link") }],
+      [{ text: "⚙️ 导出Mihomo配置", callback_data: callback("export_mihomo") }],
+      [
+        { text: "🔗 生成短链", callback_data: callback("short_link") },
+        { text: "🔗 Mihomo短链", callback_data: callback("short_mihomo") }
+      ],
       [{ text: "⬅️ 返回保存列表", callback_data: "cancel" }]
     ]
   };
@@ -1961,9 +1999,9 @@ function parseCallbackAction(data: string): CallbackAction {
   return { name, cacheId: value && /^[a-f0-9]{12}$/i.test(value) ? value : undefined };
 }
 
-async function createShortLink(env: Env, userId: number, url: string): Promise<string> {
+async function createShortLink(env: Env, userId: number, url: string, format: ShortSubscription["format"] = "base64"): Promise<string> {
   const shortId = crypto.randomUUID().replace(/-/g, "").slice(0, 10);
-  const payload: ShortSubscription = { url, format: "base64", createdBy: userId, createdAt: new Date().toISOString() };
+  const payload: ShortSubscription = { url, format, createdBy: userId, createdAt: new Date().toISOString() };
   await env.SUB_KV.put(`short:${shortId}`, JSON.stringify(payload), { expirationTtl: SHORT_LINK_TTL_SECONDS });
   return shortId;
 }
@@ -1975,13 +2013,29 @@ async function exportShortLink(shortId: string, env: Env): Promise<Response> {
 
   const result = await fetchAndParseSubscription(short.url, env);
   const cached = { ...result, url: short.url, updatedAt: short.createdAt };
-  const body = short.format === "yaml" ? toYamlSubscription(cached) : toBase64Subscription(cached);
+  let body: string;
+  try {
+    body = short.format === "mihomo"
+      ? generateMihomoSubscription(cached.raw)
+      : short.format === "yaml"
+        ? toYamlSubscription(cached)
+        : toBase64Subscription(cached);
+  } catch (error) {
+    if (error instanceof MihomoExportError) return new Response(error.message, { status: 422 });
+    throw error;
+  }
+  const isYaml = short.format === "yaml" || short.format === "mihomo";
   return new Response(body, {
     headers: {
-      "Content-Type": short.format === "yaml" ? "text/yaml; charset=utf-8" : "text/plain; charset=utf-8",
+      "Content-Type": isYaml ? "text/yaml; charset=utf-8" : "text/plain; charset=utf-8",
       "Profile-Update-Interval": "24"
     }
   });
+}
+
+function mihomoExportErrorMessage(error: unknown): string {
+  const detail = error instanceof MihomoExportError ? error.message : safeError(error);
+  return `Mihomo 导出失败：${detail}\n\n当前版本只支持包含 proxies 或 proxy-providers 的标准 Clash/Mihomo YAML；Base64 和纯文本节点订阅暂不转换。`;
 }
 
 async function isAllowedUser(userId: number, env: Env): Promise<boolean> {
