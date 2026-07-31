@@ -785,10 +785,18 @@ async function handleCallback(callback: TelegramCallbackQuery, request: Request,
     return;
   }
 
-  if (action.name === "export_mihomo" && cached) {
+  if (["export_mihomo", "short_mihomo"].includes(action.name) && cached) {
     try {
       const body = generateMihomoSubscription(cached.raw);
+      const shortId = await createShortLink(env, userId, cached.url, "mihomo");
+      const origin = new URL(request.url).origin;
       await sendTextDocument(env, chatId, mihomoSubscriptionFilename(cached), body, "Mihomo 配置已生成");
+      await editCallbackMessage(
+        env,
+        callback,
+        `Mihomo 配置与订阅链接已生成：\n${origin}/m/${shortId}`,
+        actionKeyboard(false, action.cacheId)
+      );
     } catch (error) {
       await sendMessage(env, chatId, mihomoExportErrorMessage(error));
     }
@@ -805,18 +813,6 @@ async function handleCallback(callback: TelegramCallbackQuery, request: Request,
     const shortId = await createShortLink(env, userId, cached.url);
     const origin = new URL(request.url).origin;
     await editCallbackMessage(env, callback, `短链已生成：\n${origin}/s/${shortId}`, actionKeyboard(false, action.cacheId));
-    return;
-  }
-
-  if (action.name === "short_mihomo" && cached) {
-    try {
-      generateMihomoSubscription(cached.raw);
-      const shortId = await createShortLink(env, userId, cached.url, "mihomo");
-      const origin = new URL(request.url).origin;
-      await editCallbackMessage(env, callback, `Mihomo 订阅链接已生成：\n${origin}/m/${shortId}`, actionKeyboard(false, action.cacheId));
-    } catch (error) {
-      await sendMessage(env, chatId, mihomoExportErrorMessage(error));
-    }
     return;
   }
 
@@ -1491,11 +1487,8 @@ function actionKeyboard(nodesExpanded = false, cacheId?: string, backToList = fa
       { text: "📥 导出Base64", callback_data: callback("export_base64") },
       { text: "📥 导出原始订阅", callback_data: callback("export_yaml") }
     ],
-    [{ text: "⚙️ 导出Mihomo配置", callback_data: callback("export_mihomo") }],
-    [
-      { text: "🔗 生成短链", callback_data: callback("short_link") },
-      { text: "🔗 Mihomo短链", callback_data: callback("short_mihomo") }
-    ],
+    [{ text: "⚙️ Mihomo配置与订阅", callback_data: callback("export_mihomo") }],
+    [{ text: "🔗 生成短链", callback_data: callback("short_link") }],
     [{ text: "💾 保存订阅", callback_data: callback("save") }]
   ];
   if (backToList) {
@@ -1520,11 +1513,8 @@ function savedSubscriptionKeyboard(subId: string, nodesExpanded: boolean, cacheI
         { text: "📄 导出Base64", callback_data: callback("export_base64") },
         { text: "📄 导出原始订阅", callback_data: callback("export_yaml") }
       ],
-      [{ text: "⚙️ 导出Mihomo配置", callback_data: callback("export_mihomo") }],
-      [
-        { text: "🔗 生成短链", callback_data: callback("short_link") },
-        { text: "🔗 Mihomo短链", callback_data: callback("short_mihomo") }
-      ],
+      [{ text: "⚙️ Mihomo配置与订阅", callback_data: callback("export_mihomo") }],
+      [{ text: "🔗 生成短链", callback_data: callback("short_link") }],
       [{ text: "⬅️ 返回保存列表", callback_data: "cancel" }]
     ]
   };
