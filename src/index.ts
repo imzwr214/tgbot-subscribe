@@ -108,12 +108,22 @@ interface SavedSubscriptionItem {
   lastRefreshError?: string;
 }
 
-interface ShortSubscription {
-  url: string;
-  format: "base64" | "yaml" | "mihomo";
+interface ShortLinkBase {
   createdBy: number;
   createdAt: string;
 }
+
+type ShortSubscription =
+  | (ShortLinkBase & {
+      kind?: "subscription";
+      url: string;
+      format: "base64" | "yaml" | "mihomo";
+    })
+  | (ShortLinkBase & {
+      kind: "node";
+      uri: string;
+      format: "base64";
+    });
 
 interface TelegramMessageEntity {
   type: "blockquote" | "code" | "url";
@@ -674,6 +684,17 @@ async function handleCallback(callback: TelegramCallbackQuery, request: Request,
     return;
   }
 
+  if (action.name === "short_saved_node" && action.subId) {
+    const saved = await getSavedSubscriptions(env, userId);
+    const item = saved.find((entry) => entry.id === action.subId && savedItemKind(entry) === "node");
+    if (!item) {
+      await sendMessage(env, chatId, "节点不存在或已经删除。");
+      return;
+    }
+    await sendNodeSubscriptionLink(env, userId, chatId, new URL(request.url).origin, item.url);
+    return;
+  }
+
   if (action.name === "refresh_saved" && action.subId) {
     await refreshSavedSubscription(action.subId, userId, callback, env);
     return;
@@ -731,6 +752,16 @@ async function handleCallback(callback: TelegramCallbackQuery, request: Request,
       return;
     }
     await queryAndEdit(subUrl, userId, callback, env, action.cacheId, true);
+    return;
+  }
+
+  if (action.name === "short_node") {
+    const cachedNode = await getCachedNode(env, userId, action.cacheId);
+    if (!cachedNode) {
+      await sendMessage(env, chatId, "节点缓存已过期，请重新发送节点链接。");
+      return;
+    }
+    await sendNodeSubscriptionLink(env, userId, chatId, new URL(request.url).origin, cachedNode.uri);
     return;
   }
 
@@ -887,7 +918,7 @@ async function querySavedSubscription(subId: string, userId: number, callback: T
 
   if (savedItemKind(item) === "node") {
     await touchSavedSubscriptionLastQueryAt(env, userId, subId);
-    await editCallbackMessage(env, callback, formatSingleNodeMessage(item.url), nodeActionKeyboard(undefined, true));
+    await editCallbackMessage(env, callback, formatSingleNodeMessage(item.url), nodeActionKeyboard(undefined, true, subId));
     return;
   }
 
@@ -1499,10 +1530,16 @@ function savedSubscriptionKeyboard(subId: string, nodesExpanded: boolean, cacheI
   };
 }
 
-function nodeActionKeyboard(cacheId?: string, backToList = false) {
-  const inlineKeyboard = [
-    [{ text: "保存节点", callback_data: cacheId ? `save_node:${cacheId}` : "save_node" }]
-  ];
+function nodeActionKeyboard(cacheId?: string, backToList = false, savedNodeId?: string) {
+  const inlineKeyboard: Array<Array<{ text: string; callback_data: string }>> = [];
+  if (cacheId) {
+    inlineKeyboard.push([
+      { text: "保存节点", callback_data: `save_node:${cacheId}` },
+      { text: "🔗 获取订阅链接", callback_data: `short_node:${cacheId}` }
+    ]);
+  } else if (savedNodeId) {
+    inlineKeyboard.push([{ text: "🔗 获取订阅链接", callback_data: `short_saved_node:${savedNodeId}` }]);
+  }
   if (backToList) {
     inlineKeyboard.push([{ text: "↩️ 返回保存列表", callback_data: "cancel" }]);
   }
@@ -1992,7 +2029,7 @@ function parseCallbackAction(data: string): CallbackAction {
   if (data === "cancel") return { name: "cancel" };
 
   const [name, value] = data.split(":", 2);
-  if (["query_saved", "delete_saved", "confirm_delete_saved", "refresh_saved", "nodes_saved", "collapse_nodes_saved"].includes(name)) {
+  if (["query_saved", "delete_saved", "confirm_delete_saved", "refresh_saved", "nodes_saved", "collapse_nodes_saved", "short_saved_node"].includes(name)) {
     return { name, subId: value && /^[a-f0-9]{12}$/i.test(value) ? value : undefined };
   }
 
@@ -2001,15 +2038,48 @@ function parseCallbackAction(data: string): CallbackAction {
 
 async function createShortLink(env: Env, userId: number, url: string, format: ShortSubscription["format"] = "base64"): Promise<string> {
   const shortId = crypto.randomUUID().replace(/-/g, "").slice(0, 10);
-  const payload: ShortSubscription = { url, format, createdBy: userId, createdAt: new Date().toISOString() };
+  const payload: ShortSubscription = { kind: "subscription", url, format, createdBy: userId, createdAt: new Date().toISOString() };
   await env.SUB_KV.put(`short:${shortId}`, JSON.stringify(payload), { expirationTtl: SHORT_LINK_TTL_SECONDS });
   return shortId;
+}
+
+async function createNodeShortLink(env: Env, userId: number, uri: string): Promise<string> {
+  const shortId = crypto.randomUUID().replace(/-/g, "").slice(0, 10);
+  const payload: ShortSubscription = {
+    kind: "node",
+    uri: uri.trim(),
+    format: "base64",
+    createdBy: userId,
+    createdAt: new Date().toISOString()
+  };
+  await env.SUB_KV.put(`short:${shortId}`, JSON.stringify(payload), { expirationTtl: SHORT_LINK_TTL_SECONDS });
+  return shortId;
+}
+
+async function sendNodeSubscriptionLink(env: Env, userId: number, chatId: number, origin: string, uri: string): Promise<void> {
+  const shortId = await createNodeShortLink(env, userId, uri);
+  const validDays = Math.floor(SHORT_LINK_TTL_SECONDS / (60 * 60 * 24));
+  await sendMessage(
+    env,
+    chatId,
+    `订阅链接已生成（${validDays} 天有效）：\n${origin}/s/${shortId}\n\n链接内含节点凭据，请勿公开分享。`
+  );
 }
 
 async function exportShortLink(shortId: string, env: Env): Promise<Response> {
   if (!/^[a-z0-9]{10}$/i.test(shortId)) return new Response("Invalid short link", { status: 400 });
   const short = await env.SUB_KV.get<ShortSubscription>(`short:${shortId}`, "json");
   if (!short) return new Response("Short link not found or expired", { status: 404 });
+
+  if (short.kind === "node") {
+    if (!parseNodeLines([short.uri])[0]) return new Response("Invalid node link", { status: 422 });
+    return new Response(encodeUtf8Base64(short.uri.trim()), {
+      headers: {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Profile-Update-Interval": "24"
+      }
+    });
+  }
 
   const result = await fetchAndParseSubscription(short.url, env);
   const cached = { ...result, url: short.url, updatedAt: short.createdAt };
@@ -2031,6 +2101,13 @@ async function exportShortLink(shortId: string, env: Env): Promise<Response> {
       "Profile-Update-Interval": "24"
     }
   });
+}
+
+function encodeUtf8Base64(value: string): string {
+  const bytes = new TextEncoder().encode(value);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
 }
 
 function mihomoExportErrorMessage(error: unknown): string {
