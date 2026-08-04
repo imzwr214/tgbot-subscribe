@@ -24,8 +24,8 @@ npx wrangler secret put DEBUG_TOKEN
 - `GET /setup?token=xxx`: 校验 `SETUP_TOKEN` 后设置 Telegram webhook。
 - `POST /telegram/webhook`: Telegram webhook 入口。
 - `GET /debug/subscription?token=xxx&user_id=123&url=...`: 校验 `DEBUG_TOKEN` 和白名单用户后调试订阅解析。
-- `GET /s/:id`: Base64 短链订阅导出，支持远程订阅和单节点链接。
-- `GET /m/:id`: Mihomo YAML 短链订阅导出。
+- `GET /s/:id`: 节点合集返回仅含 `proxies` 的 Clash / Koipy YAML；远程订阅和单节点链接仍返回 Base64。
+- `GET /m/:id`: 节点合集返回仅含节点信息的 Mihomo YAML。
 - `GET /health`: 健康检查。
 
 ## Telegram 用法

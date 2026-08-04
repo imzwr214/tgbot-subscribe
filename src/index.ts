@@ -1,4 +1,4 @@
-import { generateMihomoSubscription, generateMihomoSubscriptionFromProvider, MihomoExportError } from "./mihomo/generate";
+import { generateClashNodeSubscription, generateMihomoSubscription, MihomoExportError } from "./mihomo/generate";
 
 interface Env {
   BOT_TOKEN: string;
@@ -777,14 +777,14 @@ async function handleCallback(callback: TelegramCallbackQuery, request: Request,
     try {
       const origin = new URL(request.url).origin;
       const base64ShortId = await createNodeCollectionShortLink(env, userId, "base64");
-      const body = generateMihomoSubscriptionFromProvider(`${origin}/s/${base64ShortId}`, uris);
+      const body = generateClashNodeSubscription(uris);
       const mihomoShortId = await createNodeCollectionShortLink(env, userId, "mihomo", base64ShortId);
       const validDays = Math.floor(SHORT_LINK_TTL_SECONDS / (60 * 60 * 24));
       await sendTextDocument(env, chatId, "node-collection-Mihomo.yaml", body, `节点合集 Mihomo 配置已生成（${uris.length} 个节点）`);
       await sendMessage(
         env,
         chatId,
-        `节点合集订阅已生成（${uris.length} 个节点，${validDays} 天有效）：\n\n通用订阅：\n${origin}/s/${base64ShortId}\n\nMihomo 订阅：\n${origin}/m/${mihomoShortId}\n\n合集节点变动后，两条链接都会自动更新。\n链接内含全部节点凭据，请勿公开分享。`
+        `节点合集订阅已生成（${uris.length} 个节点，${validDays} 天有效）：\n\nClash / Koipy 订阅：\n${origin}/s/${base64ShortId}\n\nMihomo 订阅：\n${origin}/m/${mihomoShortId}\n\n两条链接均只包含节点信息；合集节点变动后会自动更新。\n链接内含全部节点凭据，请勿公开分享。`
       );
     } catch (error) {
       await sendMessage(env, chatId, mihomoExportErrorMessage(error));
@@ -2257,16 +2257,14 @@ async function exportShortLink(shortId: string, env: Env, origin: string): Promi
     if (uris.length === 0) return new Response("Node collection is empty", { status: 404 });
     let body: string;
     try {
-      body = short.format === "mihomo"
-        ? generateMihomoSubscriptionFromProvider(`${origin}/s/${short.base64ShortId}`, uris)
-        : encodeUtf8Base64(uris.join("\n"));
+      body = generateClashNodeSubscription(uris);
     } catch (error) {
       if (error instanceof MihomoExportError) return new Response(error.message, { status: 422 });
       throw error;
     }
     return new Response(body, {
       headers: {
-        "Content-Type": short.format === "mihomo" ? "text/yaml; charset=utf-8" : "text/plain; charset=utf-8",
+        "Content-Type": "text/yaml; charset=utf-8",
         "Profile-Update-Interval": "24"
       }
     });

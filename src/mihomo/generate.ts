@@ -237,43 +237,17 @@ export function generateMihomoSubscription(raw: string): string {
   return `${stringify(config, { indent: 2, lineWidth: 0 }).trimEnd()}\n`;
 }
 
-export function generateMihomoSubscriptionFromProvider(providerUrl: string, nodeUris: string[] = []): string {
-  let parsedUrl: URL;
-  try {
-    parsedUrl = new URL(providerUrl);
-  } catch {
-    throw new MihomoExportError("节点合集订阅链接无效");
-  }
-  if (!["http:", "https:"].includes(parsedUrl.protocol)) {
-    throw new MihomoExportError("节点合集订阅链接必须使用 HTTP 或 HTTPS");
-  }
-  const providerId = parsedUrl.pathname.split("/").filter(Boolean).at(-1)?.replace(/[^a-z0-9_-]/gi, "").slice(0, 32) || "default";
+export function generateClashNodeSubscription(nodeUris: string[]): string {
   const normalizedUris = nodeUris.map((uri) => uri.trim()).filter(Boolean);
   const inlineProxies = normalizedUris
     .map((uri, index) => toMihomoVlessProxy(uri, index))
     .filter((proxy): proxy is MihomoConfig => proxy !== null);
   ensureUniqueProxyNames(inlineProxies);
-
-  const source: MihomoConfig = {};
-  if (inlineProxies.length > 0) source.proxies = inlineProxies;
+  if (inlineProxies.length === 0) throw new MihomoExportError("节点合集没有可导出的 VLESS 节点");
   if (inlineProxies.length !== normalizedUris.length) {
-    source["proxy-providers"] = {
-      "节点合集": {
-        type: "http",
-        url: parsedUrl.toString(),
-        path: `./proxy_providers/tgsub-node-collection-${providerId}.yaml`,
-        interval: 86400,
-        "health-check": {
-          enable: true,
-          url: HEALTH_CHECK_URL,
-          interval: HEALTH_CHECK_INTERVAL,
-          lazy: true
-        }
-      }
-    };
+    throw new MihomoExportError("Clash / Koipy 节点合集目前只支持 VLESS 节点");
   }
-
-  return generateMihomoSubscription(stringify(source, { indent: 2, lineWidth: 0 }));
+  return `${stringify({ proxies: inlineProxies }, { indent: 2, lineWidth: 0 }).trimEnd()}\n`;
 }
 
 function toMihomoVlessProxy(uri: string, index: number): MihomoConfig | null {
