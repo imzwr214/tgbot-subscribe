@@ -237,7 +237,7 @@ export function generateMihomoSubscription(raw: string): string {
   return `${stringify(config, { indent: 2, lineWidth: 0 }).trimEnd()}\n`;
 }
 
-export function generateMihomoSubscriptionFromProvider(providerUrl: string): string {
+export function generateMihomoSubscriptionFromProvider(providerUrl: string, nodeUris: string[] = []): string {
   let parsedUrl: URL;
   try {
     parsedUrl = new URL(providerUrl);
@@ -248,9 +248,16 @@ export function generateMihomoSubscriptionFromProvider(providerUrl: string): str
     throw new MihomoExportError("节点合集订阅链接必须使用 HTTP 或 HTTPS");
   }
   const providerId = parsedUrl.pathname.split("/").filter(Boolean).at(-1)?.replace(/[^a-z0-9_-]/gi, "").slice(0, 32) || "default";
+  const normalizedUris = nodeUris.map((uri) => uri.trim()).filter(Boolean);
+  const inlineProxies = normalizedUris
+    .map((uri, index) => toMihomoVlessProxy(uri, index))
+    .filter((proxy): proxy is MihomoConfig => proxy !== null);
+  ensureUniqueProxyNames(inlineProxies);
 
-  return generateMihomoSubscription(stringify({
-    "proxy-providers": {
+  const source: MihomoConfig = {};
+  if (inlineProxies.length > 0) source.proxies = inlineProxies;
+  if (inlineProxies.length !== normalizedUris.length) {
+    source["proxy-providers"] = {
       "节点合集": {
         type: "http",
         url: parsedUrl.toString(),
@@ -263,8 +270,100 @@ export function generateMihomoSubscriptionFromProvider(providerUrl: string): str
           lazy: true
         }
       }
-    }
-  }, { indent: 2, lineWidth: 0 }));
+    };
+  }
+
+  return generateMihomoSubscription(stringify(source, { indent: 2, lineWidth: 0 }));
+}
+
+function toMihomoVlessProxy(uri: string, index: number): MihomoConfig | null {
+  let url: URL;
+  try {
+    url = new URL(uri);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "vless:") return null;
+
+  const uuid = decodeUriPart(url.username);
+  const server = url.hostname;
+  const port = Number(url.port);
+  if (!uuid || !server || !Number.isInteger(port) || port < 1 || port > 65535) return null;
+
+  const query = url.searchParams;
+  const security = query.get("security")?.toLowerCase() ?? "none";
+  const network = query.get("type")?.toLowerCase() || "tcp";
+  const sni = query.get("sni") || query.get("servername") || "";
+  const host = query.get("host") || sni;
+  const proxy: MihomoConfig = {
+    name: decodeUriPart(url.hash.slice(1)).trim() || `VLESS ${index + 1}`,
+    type: "vless",
+    server,
+    port,
+    uuid,
+    network,
+    udp: true
+  };
+
+  const flow = query.get("flow");
+  if (flow) proxy.flow = flow;
+  const fingerprint = query.get("fp");
+  if (fingerprint) proxy["client-fingerprint"] = fingerprint;
+  if (security === "tls" || security === "reality") {
+    proxy.tls = true;
+    if (sni) proxy.servername = sni;
+    const alpn = query.get("alpn")?.split(",").map((item) => item.trim()).filter(Boolean);
+    if (alpn?.length) proxy.alpn = alpn;
+    if (["1", "true"].includes(query.get("allowInsecure")?.toLowerCase() ?? "")) proxy["skip-cert-verify"] = true;
+  }
+  if (security === "reality") {
+    const publicKey = query.get("pbk");
+    const shortId = query.get("sid");
+    if (!publicKey) return null;
+    proxy["reality-opts"] = {
+      "public-key": publicKey,
+      ...(shortId ? { "short-id": shortId } : {})
+    };
+  }
+
+  if (network === "ws") {
+    proxy["ws-opts"] = {
+      path: query.get("path") || "/",
+      ...(host ? { headers: { Host: host } } : {})
+    };
+  } else if (network === "grpc") {
+    const serviceName = query.get("serviceName") || query.get("service-name");
+    if (serviceName) proxy["grpc-opts"] = { "grpc-service-name": serviceName };
+  } else if (network === "httpupgrade") {
+    proxy["http-upgrade-opts"] = {
+      path: query.get("path") || "/",
+      ...(host ? { headers: { Host: host } } : {})
+    };
+  } else if (network === "xhttp") {
+    proxy["xhttp-opts"] = {
+      path: query.get("path") || "/",
+      ...(query.get("mode") ? { mode: query.get("mode") } : {})
+    };
+  }
+  return proxy;
+}
+
+function decodeUriPart(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function ensureUniqueProxyNames(proxies: MihomoConfig[]): void {
+  const counts = new Map<string, number>();
+  for (const proxy of proxies) {
+    const baseName = typeof proxy.name === "string" ? proxy.name : "VLESS";
+    const count = (counts.get(baseName) ?? 0) + 1;
+    counts.set(baseName, count);
+    if (count > 1) proxy.name = `${baseName} ${count}`;
+  }
 }
 
 function buildProxyGroups(): MihomoGroup[] {

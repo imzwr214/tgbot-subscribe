@@ -777,7 +777,7 @@ async function handleCallback(callback: TelegramCallbackQuery, request: Request,
     try {
       const origin = new URL(request.url).origin;
       const base64ShortId = await createNodeCollectionShortLink(env, userId, "base64");
-      const body = generateMihomoSubscriptionFromProvider(`${origin}/s/${base64ShortId}`);
+      const body = generateMihomoSubscriptionFromProvider(`${origin}/s/${base64ShortId}`, uris);
       const mihomoShortId = await createNodeCollectionShortLink(env, userId, "mihomo", base64ShortId);
       const validDays = Math.floor(SHORT_LINK_TTL_SECONDS / (60 * 60 * 24));
       await sendTextDocument(env, chatId, "node-collection-Mihomo.yaml", body, `节点合集 Mihomo 配置已生成（${uris.length} 个节点）`);
@@ -2258,7 +2258,7 @@ async function exportShortLink(shortId: string, env: Env, origin: string): Promi
     let body: string;
     try {
       body = short.format === "mihomo"
-        ? generateMihomoSubscriptionFromProvider(`${origin}/s/${short.base64ShortId}`)
+        ? generateMihomoSubscriptionFromProvider(`${origin}/s/${short.base64ShortId}`, uris)
         : encodeUtf8Base64(uris.join("\n"));
     } catch (error) {
       if (error instanceof MihomoExportError) return new Response(error.message, { status: 422 });
