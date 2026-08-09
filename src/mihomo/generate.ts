@@ -133,6 +133,13 @@ export class MihomoExportError extends Error {
   }
 }
 
+export interface ClashNodeSubscriptionResult {
+  yaml: string;
+  exportedCount: number;
+  skippedCount: number;
+  skippedProtocols: string[];
+}
+
 export function generateMihomoSubscription(raw: string): string {
   let parsed: unknown;
   try {
@@ -237,17 +244,26 @@ export function generateMihomoSubscription(raw: string): string {
   return `${stringify(config, { indent: 2, lineWidth: 0 }).trimEnd()}\n`;
 }
 
-export function generateClashNodeSubscription(nodeUris: string[]): string {
+export function generateClashNodeSubscription(nodeUris: string[]): ClashNodeSubscriptionResult {
   const normalizedUris = nodeUris.map((uri) => uri.trim()).filter(Boolean);
-  const inlineProxies = normalizedUris
-    .map((uri, index) => toMihomoVlessProxy(uri, index))
-    .filter((proxy): proxy is MihomoConfig => proxy !== null);
+  const converted = normalizedUris.map((uri, index) => ({
+    uri,
+    proxy: toMihomoVlessProxy(uri, index)
+  }));
+  const inlineProxies = converted.map((item) => item.proxy).filter((proxy): proxy is MihomoConfig => proxy !== null);
   ensureUniqueProxyNames(inlineProxies);
   if (inlineProxies.length === 0) throw new MihomoExportError("节点合集没有可导出的 VLESS 节点");
-  if (inlineProxies.length !== normalizedUris.length) {
-    throw new MihomoExportError("Clash / Koipy 节点合集目前只支持 VLESS 节点");
-  }
-  return `${stringify({ proxies: inlineProxies }, { indent: 2, lineWidth: 0 }).trimEnd()}\n`;
+  const skipped = converted.filter((item) => item.proxy === null);
+  return {
+    yaml: `${stringify({ proxies: inlineProxies }, { indent: 2, lineWidth: 0 }).trimEnd()}\n`,
+    exportedCount: inlineProxies.length,
+    skippedCount: skipped.length,
+    skippedProtocols: uniqueStrings(skipped.map((item) => nodeProtocolName(item.uri)))
+  };
+}
+
+function nodeProtocolName(uri: string): string {
+  return uri.match(/^([a-z][a-z0-9+.-]*):\/\//i)?.[1]?.toUpperCase() ?? "未知";
 }
 
 function toMihomoVlessProxy(uri: string, index: number): MihomoConfig | null {
