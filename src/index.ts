@@ -175,6 +175,7 @@ const REQUEST_TIMEOUT_MS = 8000;
 const SAVED_PAGE_SIZE = 10;
 const SNAPSHOT_STALE_MS = 24 * 60 * 60 * 1000;
 const PREFERRED_UA = "clash-verge/v2.0.0";
+const KOIPY_SUBSCRIPTION_UA_MARKER = "Koipy-MiaoSpeed/";
 const AUTHORIZED_USERS_KEY = "authorized_users";
 const WEB_ADMIN_NAME = "imzwr";
 
@@ -237,11 +238,11 @@ export default {
       }
 
       if (request.method === "GET" && url.pathname.startsWith("/s/")) {
-        return exportShortLink(url.pathname.slice(3), env, url.origin);
+        return exportShortLink(url.pathname.slice(3), env, request.headers.get("user-agent") ?? "");
       }
 
       if (request.method === "GET" && url.pathname.startsWith("/m/")) {
-        return exportShortLink(url.pathname.slice(3), env, url.origin);
+        return exportShortLink(url.pathname.slice(3), env, request.headers.get("user-agent") ?? "");
       }
 
       if (request.method === "POST" && url.pathname === "/telegram/webhook") {
@@ -2366,7 +2367,7 @@ async function createNodeCollectionShortLink(env: Env, userId: number): Promise<
   return shortId;
 }
 
-async function exportShortLink(shortId: string, env: Env, origin: string): Promise<Response> {
+async function exportShortLink(shortId: string, env: Env, userAgent: string): Promise<Response> {
   if (!/^[a-z0-9]{10}$/i.test(shortId)) return new Response("Invalid short link", { status: 400 });
   const short = await env.SUB_KV.get<ShortSubscription>(`short:${shortId}`, "json");
   if (!short) return new Response("Short link not found or expired", { status: 404 });
@@ -2387,7 +2388,10 @@ async function exportShortLink(shortId: string, env: Env, origin: string): Promi
     let body: string;
     try {
       const generated = generateClashNodeSubscription(uris);
-      body = short.format === "mihomo" ? generateMihomoSubscription(generated.yaml) : generated.yaml;
+      // Koipy/MiaoSpeed needs nodes only; embedded Mihomo DNS alters script-test resolution.
+      body = short.format === "mihomo" && !userAgent.includes(KOIPY_SUBSCRIPTION_UA_MARKER)
+        ? generateMihomoSubscription(generated.yaml)
+        : generated.yaml;
     } catch (error) {
       if (error instanceof MihomoExportError) return new Response(error.message, { status: 422 });
       throw error;
@@ -2395,7 +2399,8 @@ async function exportShortLink(shortId: string, env: Env, origin: string): Promi
     return new Response(body, {
       headers: {
         "Content-Type": "text/yaml; charset=utf-8",
-        "Profile-Update-Interval": "24"
+        "Profile-Update-Interval": "24",
+        "Vary": "User-Agent"
       }
     });
   }
