@@ -350,6 +350,7 @@ function botCommands(): Array<{ command: string; description: string }> {
     { command: "query", description: "查询订阅或批量添加节点" },
     { command: "sub", description: "管理订阅与节点合集" },
     { command: "monitor", description: "选择机场并管理稳定性监测" },
+    { command: "monitorreport", description: "查看已开启机场的稳定性汇总" },
     { command: "help", description: "查看帮助" }
   ];
 }
@@ -867,6 +868,11 @@ async function handleMessage(message: TelegramMessage, request: Request, env: En
     return;
   }
 
+  if (command === "/monitorreport") {
+    await sendMonitorReport(env, message.chat.id, userId);
+    return;
+  }
+
   if (command === "/query" && !extractQueryInput(text)) {
     await sendMessage(env, message.chat.id, "用法：/query <订阅链接或节点链接>");
     return;
@@ -1225,6 +1231,38 @@ async function sendMonitorList(env: Env, chatId: number, userId: number, page = 
   await sendMessage(env, chatId, formatMonitorListText(subscriptions, summaries, page), monitorListKeyboard(subscriptions, summaries, page));
 }
 
+async function sendMonitorReport(env: Env, chatId: number, userId: number): Promise<void> {
+  const [subscriptions, summaries] = await Promise.all([
+    getSavedSubscriptions(env, userId),
+    listMonitorSummaries(env.MONITOR_DB, userId)
+  ]);
+  const savedById = new Map(subscriptions.map((item) => [item.id, item]));
+  const enabled = summaries.filter((summary) => summary.enabled);
+  if (enabled.length === 0) {
+    await sendMessage(env, chatId, "还没有开启稳定性监测的机场。请先发送 /monitor 选择机场并开启监测。");
+    return;
+  }
+
+  const header = [
+    "📊 机场稳定性报告",
+    "检测点：海创 VPS｜每10分钟一次",
+    `生成时间：${formatIsoDateTime(new Date().toISOString())}`
+  ].join("\n");
+  const sections = enabled.map((summary) => formatMonitorReportSection(savedById.get(summary.subId), summary));
+  const keyboard = { inline_keyboard: [[{ text: "📡 管理监测", callback_data: "monitor_list" }]] };
+  let message = header;
+  for (const section of sections) {
+    const next = `${message}\n\n${section}`;
+    if (next.length > 3800 && message !== header) {
+      await sendMessage(env, chatId, message, keyboard);
+      message = `${header}（续）\n\n${section}`;
+    } else {
+      message = next;
+    }
+  }
+  await sendMessage(env, chatId, message, keyboard);
+}
+
 async function showMonitorList(callback: TelegramCallbackQuery, userId: number, env: Env, page = 0): Promise<void> {
   const [subscriptions, summaries] = await Promise.all([
     getSavedSubscriptions(env, userId),
@@ -1327,6 +1365,24 @@ function formatMonitorTargetText(item: SavedSubscriptionItem, summary?: MonitorS
     lines.push(`订阅接口：${summary.subscriptionFetchOk ? "正常" : "异常，已使用上次成功快照测试"}`);
   }
   lines.push(`最后检测：${summary.lastCheckedAt ? formatIsoDateTime(new Date(summary.lastCheckedAt).toISOString()) : "等待首轮检测"}`);
+  if (summary.lastError) lines.push(`探针信息：${monitorErrorText(summary.lastError)}`);
+  return lines.join("\n");
+}
+
+function formatMonitorReportSection(item: SavedSubscriptionItem | undefined, summary: MonitorSummary): string {
+  const name = item ? savedItemDisplayName(item) : "已删除的机场订阅";
+  const status = effectiveMonitorStatus(summary);
+  const lines = [`${monitorStatusIcon(summary)} ${name}`, `状态：${monitorStatusLabel(status)}`];
+  if (summary.totalNodes !== null && summary.onlineNodes !== null && !summary.stale) {
+    const ratio = summary.totalNodes > 0 ? summary.onlineNodes / summary.totalNodes * 100 : 0;
+    lines.push(`当前节点：${summary.onlineNodes}/${summary.totalNodes} 在线（${ratio.toFixed(1)}%）`);
+  }
+  if (summary.medianDelayMs !== null && !summary.stale) lines.push(`中位延迟：${summary.medianDelayMs} ms`);
+  lines.push(
+    `稳定率：24小时 ${formatMonitorRate(summary.rate24h)}｜7天 ${formatMonitorRate(summary.rate7d)}｜30天 ${formatMonitorRate(summary.rate30d)}`,
+    `24小时覆盖：${formatMonitorCoverage(summary, 24 * 60 * 60 * 1000, summary.samples24h)}`,
+    `最后检测：${summary.lastCheckedAt ? formatIsoDateTime(new Date(summary.lastCheckedAt).toISOString()) : "等待首轮检测"}`
+  );
   if (summary.lastError) lines.push(`探针信息：${monitorErrorText(summary.lastError)}`);
   return lines.join("\n");
 }
@@ -2264,6 +2320,7 @@ function helpTextV2(): string {
     "/query <订阅或节点链接> 群聊里查询",
     "/sub 管理订阅与节点合集",
     "/monitor 选择机场并管理稳定性监测",
+    "/monitorreport 查看已开启机场的稳定性汇总",
     "/users 管理员查看授权用户",
     "/allow <userId> 管理员授权用户",
     "/revoke <userId> 管理员取消授权用户",
