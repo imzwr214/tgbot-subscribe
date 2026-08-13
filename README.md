@@ -1,6 +1,6 @@
 # Telegram 订阅查询机器人
 
-基于 Cloudflare Workers 的私人 Telegram 订阅查询机器人，支持订阅流量查询、节点统计、保存订阅、Mihomo 配置和原始订阅导出。
+基于 Cloudflare Workers 的私人 Telegram 订阅查询机器人，支持订阅流量查询、节点统计、保存订阅、Mihomo 配置、原始订阅导出和机场稳定性监测。
 
 ## 配置
 
@@ -9,6 +9,7 @@
 - `ALLOWED_USER_IDS`: 允许使用机器人的 Telegram 用户 ID，多个用逗号分隔。
 - `SUB_FETCH_PROXY`: 可选订阅抓取代理地址。配置后会优先走代理，代理失败后自动 fallback 到 Worker 直连并尝试多个常见 User-Agent。
 - `SUB_KV`: Cloudflare KV 命名空间绑定。
+- `MONITOR_DB`: 保存机场监测目标和最近 30 天汇总样本的 D1 绑定。
 
 敏感值必须用 Secret 设置，不要写进代码：
 
@@ -16,6 +17,7 @@
 npx wrangler secret put BOT_TOKEN
 npx wrangler secret put SETUP_TOKEN
 npx wrangler secret put DEBUG_TOKEN
+npx wrangler secret put MONITOR_TOKEN
 ```
 
 ## 路由
@@ -32,6 +34,7 @@ npx wrangler secret put DEBUG_TOKEN
 
 - `/start` 或 `/help`: 查看提示。
 - `/sub`: 查询已保存订阅。
+- `/monitor`: 选择一个已保存机场，开启、暂停或查看稳定性监测。
 - `/json`: 回复某条消息发送，导出被回复消息的 JSON 文件。
 - 直接发送订阅链接: 查询流量、过期时间、节点数量、协议和地区。
 - 直接发送节点链接: 解析单个节点。
@@ -45,6 +48,17 @@ npx wrangler secret put DEBUG_TOKEN
 - 保存订阅
 - 分页管理、重命名保存项
 - 清空节点合集（二次确认）
+- 按机场开启 / 暂停稳定性监测
+
+## 机场稳定性监测
+
+- 海创 VPS 上的 `monitor-agent/monitor_agent.py` 每 10 分钟领取用户主动开启的机场任务。
+- 每个节点只请求一次 Cloudflare 204 地址，不进行下载测速。
+- Worker 负责 Bot 交互和鉴权，D1 保存机场级汇总；订阅 URL 和节点凭据不会写入 D1。
+- 订阅接口临时失败时会使用上一次成功快照继续测试，并在结果中单独标明订阅接口异常。
+- 连续两次无可用节点才发送掉线提醒，连续两次恢复正常才发送恢复提醒。
+- 探针超时或自身故障显示为“未知”，不计作机场离线。
+- D1 历史保留 30 天，由 Worker Cron 每天清理。
 
 ## 注意
 

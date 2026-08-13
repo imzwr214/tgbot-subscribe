@@ -1,0 +1,26 @@
+[Unit]
+Description=TG subscription airport monitor probe
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=tg-sub-monitor
+Group=tg-sub-monitor
+EnvironmentFile=/etc/tg-sub-monitor.env
+WorkingDirectory=/opt/tg-sub-monitor
+ExecStart=/usr/bin/python3 /opt/tg-sub-monitor/monitor_agent.py
+TimeoutStartSec=9min
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryMax=768M
+
+[Install]
+WantedBy=multi-user.target

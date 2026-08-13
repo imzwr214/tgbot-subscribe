@@ -1,0 +1,12 @@
+[Unit]
+Description=Run TG subscription airport monitor every 10 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitInactiveSec=10min
+RandomizedDelaySec=20s
+Persistent=true
+Unit=tg-sub-monitor.service
+
+[Install]
+WantedBy=timers.target

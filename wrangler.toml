@@ -11,3 +11,12 @@ SUB_FETCH_PROXY = "https://tg-sub-fetch-proxy.vercel.app/api/fetch"
 [[kv_namespaces]]
 binding = "SUB_KV"
 id = "f9a19131bf9c48bcb097bf4ec1a429ae"
+
+[[d1_databases]]
+binding = "MONITOR_DB"
+database_name = "tg-sub-bot-monitor"
+database_id = "a638dde2-2c30-4518-b86a-1550df5f0c2b"
+migrations_dir = "migrations"
+
+[triggers]
+crons = ["17 3 * * *"]

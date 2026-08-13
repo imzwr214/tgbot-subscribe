@@ -5,3 +5,5 @@ dist/
 *.log
 *.zip
 ref-tg-sub-bot/
+__pycache__/
+*.pyc
