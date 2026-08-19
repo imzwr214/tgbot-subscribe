@@ -141,6 +141,10 @@ interface PendingSavedSubscriptionSourceUpdate {
   promptMessageId: number;
 }
 
+interface NodeSelectionState {
+  selectedIds: string[];
+}
+
 type ShortSubscription =
   | (ShortLinkBase & {
       kind?: "subscription";
@@ -160,6 +164,11 @@ type ShortSubscription =
       kind: "node-collection";
       format: "mihomo";
       base64ShortId?: string;
+    })
+  | (ShortLinkBase & {
+      kind: "node-selection";
+      nodeIds: string[];
+      format: "mihomo";
     })
   | (ShortLinkBase & {
       kind: "saved-subscription";
@@ -183,6 +192,12 @@ interface CallbackAction {
   cacheId?: string;
   subId?: string;
   page?: number;
+}
+
+interface NodeSelectionPage {
+  items: SavedSubscriptionItem[];
+  page: number;
+  totalPages: number;
 }
 
 interface WebRequestBody {
@@ -214,6 +229,7 @@ const WEB_ADMIN_NAME = "imzwr";
 const PRIVATE_SUB_MENU_TEXT = "📦 我的订阅";
 const MONITOR_DAILY_REPORT_CRON = "0 1 * * *";
 const PENDING_SAVED_SOURCE_UPDATE_TTL_SECONDS = 60 * 10;
+const NODE_SELECTION_TTL_SECONDS = 60 * 30;
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -1078,6 +1094,38 @@ async function handleCallback(callback: TelegramCallbackQuery, request: Request,
     return;
   }
 
+  if (action.name === "select_nodes") {
+    await startNodeSelection(userId, callback, env);
+    return;
+  }
+
+  if (action.name === "toggle_node" && action.subId) {
+    await toggleSelectedNode(action.subId, userId, callback, env);
+    return;
+  }
+
+  if (action.name === "node_selection_page") {
+    await showNodeSelection(userId, callback, env, action.page);
+    return;
+  }
+
+  if (["select_nodes_all", "select_nodes_none"].includes(action.name)) {
+    await setSelectedNodes(userId, callback, env, action.name === "select_nodes_all");
+    return;
+  }
+
+  if (action.name === "export_selected_nodes") {
+    await exportSelectedNodeCollection(userId, chatId, callback, request, env);
+    return;
+  }
+
+  if (action.name === "node_selection_cancel") {
+    await env.SUB_KV.delete(nodeSelectionKey(userId));
+    const saved = await getSavedSubscriptions(env, userId);
+    await editCallbackMessage(env, callback, formatNodeCollectionListText(saved), nodeCollectionListKeyboard(saved));
+    return;
+  }
+
   if (["export_node_collection", "merge_nodes", "mihomo_nodes"].includes(action.name)) {
     const uris = await getSavedNodeUris(env, userId);
     if (uris.length === 0) {
@@ -1182,6 +1230,93 @@ async function handleCallback(callback: TelegramCallbackQuery, request: Request,
   }
 
   await sendMessage(env, chatId, "暂不支持这个操作。");
+}
+
+async function startNodeSelection(userId: number, callback: TelegramCallbackQuery, env: Env): Promise<void> {
+  const items = savedNodeItems(await getSavedSubscriptions(env, userId));
+  if (items.length === 0) {
+    await editCallbackMessage(env, callback, "节点合集还是空的，请先发送节点链接并加入合集。", nodeCollectionListKeyboard([]));
+    return;
+  }
+  await putNodeSelection(env, userId, items.map((item) => item.id));
+  await showNodeSelection(userId, callback, env, 0);
+}
+
+async function toggleSelectedNode(subId: string, userId: number, callback: TelegramCallbackQuery, env: Env): Promise<void> {
+  const items = savedNodeItems(await getSavedSubscriptions(env, userId));
+  const state = await getNodeSelection(env, userId);
+  if (!state || !items.some((item) => item.id === subId)) {
+    await editCallbackMessage(env, callback, "节点选择已过期或节点已删除，请重新开始选择。", nodeCollectionListKeyboard(await getSavedSubscriptions(env, userId)));
+    return;
+  }
+  const selected = new Set(state.selectedIds.filter((id) => items.some((item) => item.id === id)));
+  if (selected.has(subId)) selected.delete(subId);
+  else selected.add(subId);
+  await putNodeSelection(env, userId, [...selected]);
+  await showNodeSelection(userId, callback, env, nodeSelectionPageForItem(items, subId));
+}
+
+async function setSelectedNodes(userId: number, callback: TelegramCallbackQuery, env: Env, selectAll: boolean): Promise<void> {
+  const items = savedNodeItems(await getSavedSubscriptions(env, userId));
+  if (items.length === 0) {
+    await editCallbackMessage(env, callback, "节点合集还是空的，请先发送节点链接并加入合集。", nodeCollectionListKeyboard([]));
+    return;
+  }
+  await putNodeSelection(env, userId, selectAll ? items.map((item) => item.id) : []);
+  await showNodeSelection(userId, callback, env, 0);
+}
+
+async function showNodeSelection(userId: number, callback: TelegramCallbackQuery, env: Env, requestedPage = 0): Promise<void> {
+  const items = savedNodeItems(await getSavedSubscriptions(env, userId));
+  const state = await getNodeSelection(env, userId);
+  if (!state || items.length === 0) {
+    await editCallbackMessage(env, callback, "节点选择已过期或节点合集为空，请重新开始选择。", nodeCollectionListKeyboard(await getSavedSubscriptions(env, userId)));
+    return;
+  }
+  const selectedIds = new Set(state.selectedIds.filter((id) => items.some((item) => item.id === id)));
+  const page = nodeSelectionPage(items, requestedPage);
+  const lines = [`选择要生成订阅的节点：已选 ${selectedIds.size}/${items.length} 个（第 ${page.page + 1}/${page.totalPages} 页）`, "点击节点可勾选或取消；选择状态保留 30 分钟。"];
+  for (const item of page.items) {
+    const protocol = parseNodeLines([item.url])[0]?.protocol ?? "未知";
+    lines.push(`${selectedIds.has(item.id) ? "✅" : "⬜"} ${savedItemDisplayName(item)}（${protocol}）`);
+  }
+  await editCallbackMessage(env, callback, lines.join("\n"), nodeSelectionKeyboard(page, selectedIds));
+}
+
+async function exportSelectedNodeCollection(userId: number, chatId: number, callback: TelegramCallbackQuery, request: Request, env: Env): Promise<void> {
+  const items = savedNodeItems(await getSavedSubscriptions(env, userId));
+  const state = await getNodeSelection(env, userId);
+  if (!state || items.length === 0) {
+    await editCallbackMessage(env, callback, "节点选择已过期或节点合集为空，请重新开始选择。", nodeCollectionListKeyboard(await getSavedSubscriptions(env, userId)));
+    return;
+  }
+  const selectedIds = new Set(state.selectedIds);
+  const selectedItems = items.filter((item) => selectedIds.has(item.id));
+  if (selectedItems.length === 0) {
+    await editCallbackMessage(env, callback, "还没有选择节点，请至少勾选一个节点后再生成。", nodeSelectionKeyboard(nodeSelectionPage(items, 0), selectedIds));
+    return;
+  }
+
+  try {
+    const generated = generateClashNodeSubscription(selectedItems.map((item) => item.url));
+    const body = generateMihomoSubscription(generated.yaml);
+    const mihomoShortId = await createSelectedNodeCollectionShortLink(env, userId, selectedItems.map((item) => item.id));
+    const origin = new URL(request.url).origin;
+    const validDays = Math.floor(SHORT_LINK_TTL_SECONDS / (60 * 60 * 24));
+    const skipped = generated.skippedCount > 0
+      ? `\n\n未导出 ${generated.skippedCount} 个暂不支持的节点：${generated.skippedProtocols.join("、")}`
+      : "";
+    await sendTextDocument(env, chatId, "selected-node-collection-Mihomo.yaml", body, `已选节点 Mihomo 配置已生成（${generated.exportedCount} 个节点）`);
+    await sendMessage(
+      env,
+      chatId,
+      `已选节点 Mihomo 订阅已生成（已选 ${selectedItems.length} 个，导出 ${generated.exportedCount} 个，${validDays} 天有效）：\n${origin}/m/${mihomoShortId}${skipped}\n\n所选节点被删除后会自动从该订阅中移除。链接内含节点凭据，请勿公开分享。`
+    );
+    await env.SUB_KV.delete(nodeSelectionKey(userId));
+    await editCallbackMessage(env, callback, "已生成所选节点订阅。", nodeCollectionListKeyboard(await getSavedSubscriptions(env, userId)));
+  } catch (error) {
+    await editCallbackMessage(env, callback, mihomoExportErrorMessage(error), nodeSelectionKeyboard(nodeSelectionPage(items, 0), selectedIds));
+  }
 }
 
 async function queryAndSend(subUrl: string, userId: number, chatId: number, env: Env, replyToMessageId?: number): Promise<void> {
@@ -1590,7 +1725,8 @@ function nodeCollectionListKeyboard(subscriptions: SavedSubscriptionItem[], requ
   const page = savedItemsPage(subscriptions, "node", requestedPage);
   if (page.total === 0) return { inline_keyboard: [[{ text: "⬅️ 返回保存列表", callback_data: "cancel" }]] };
   const rows: Array<Array<{ text: string; callback_data: string }>> = [
-    [{ text: `⚙️ 生成 Mihomo 订阅 (${page.total})`, callback_data: "export_node_collection" }],
+    [{ text: `🎯 选择节点生成 Mihomo (${page.total})`, callback_data: "select_nodes" }],
+    [{ text: `⚡ 全部节点生成 Mihomo (${page.total})`, callback_data: "export_node_collection" }],
     ...page.items.map((item) => [
       { text: savedItemButtonText(item), callback_data: `query_saved:${item.id}` },
       { text: "✏️", callback_data: `rename_saved:${item.id}` },
@@ -1601,6 +1737,45 @@ function nodeCollectionListKeyboard(subscriptions: SavedSubscriptionItem[], requ
   if (pagination.length > 0) rows.push(pagination);
   rows.push([{ text: "清空节点合集", callback_data: "confirm_clear_nodes" }]);
   rows.push([{ text: "⬅️ 返回保存列表", callback_data: "cancel" }]);
+  return { inline_keyboard: rows };
+}
+
+function savedNodeItems(subscriptions: SavedSubscriptionItem[]): SavedSubscriptionItem[] {
+  return subscriptions
+    .filter((item) => savedItemKind(item) === "node")
+    .sort((left, right) => (right.lastQueryAt ?? right.updatedAt).localeCompare(left.lastQueryAt ?? left.updatedAt));
+}
+
+function nodeSelectionPage(items: SavedSubscriptionItem[], requestedPage = 0): NodeSelectionPage {
+  const totalPages = Math.max(1, Math.ceil(items.length / SAVED_PAGE_SIZE));
+  const page = Math.min(Math.max(0, requestedPage), totalPages - 1);
+  return {
+    items: items.slice(page * SAVED_PAGE_SIZE, (page + 1) * SAVED_PAGE_SIZE),
+    page,
+    totalPages
+  };
+}
+
+function nodeSelectionPageForItem(items: SavedSubscriptionItem[], subId: string): number {
+  const index = items.findIndex((item) => item.id === subId);
+  return index < 0 ? 0 : Math.floor(index / SAVED_PAGE_SIZE);
+}
+
+function nodeSelectionKeyboard(page: NodeSelectionPage, selectedIds: Set<string>) {
+  const rows: Array<Array<{ text: string; callback_data: string }>> = page.items.map((item) => [
+    {
+      text: `${selectedIds.has(item.id) ? "✅" : "⬜"} ${savedItemButtonText(item)}`,
+      callback_data: `toggle_node:${item.id}`
+    }
+  ]);
+  const pagination = paginationRow("node_selection_page", page.page, page.totalPages);
+  if (pagination.length > 0) rows.push(pagination);
+  rows.push([
+    { text: "全选", callback_data: "select_nodes_all" },
+    { text: "全不选", callback_data: "select_nodes_none" }
+  ]);
+  rows.push([{ text: `⚙️ 生成已选节点订阅 (${selectedIds.size})`, callback_data: "export_selected_nodes" }]);
+  rows.push([{ text: "⬅️ 取消选择", callback_data: "node_selection_cancel" }]);
   return { inline_keyboard: rows };
 }
 
@@ -2454,7 +2629,8 @@ function nodeActionKeyboard(cacheId?: string, backToList = false, savedNodeId?: 
   if (cacheId) {
     inlineKeyboard.push([{ text: "➕ 加入节点合集", callback_data: `save_node:${cacheId}` }]);
   } else if (savedNodeId) {
-    inlineKeyboard.push([{ text: "⚙️ 生成合集 Mihomo 订阅", callback_data: "export_node_collection" }]);
+    inlineKeyboard.push([{ text: "🎯 选择节点生成 Mihomo", callback_data: "select_nodes" }]);
+    inlineKeyboard.push([{ text: "⚡ 全部节点生成 Mihomo", callback_data: "export_node_collection" }]);
     inlineKeyboard.push([{ text: "✏️ 重命名", callback_data: `rename_saved:${savedNodeId}` }]);
   }
   if (backToList) {
@@ -2473,7 +2649,8 @@ function nodeBundleKeyboard(cacheId: string) {
 
 function nodeCollectionKeyboard(nodeCount: number, backToList = false) {
   const inlineKeyboard = [
-    [{ text: `⚙️ 生成 Mihomo 订阅 (${nodeCount})`, callback_data: "export_node_collection" }],
+    [{ text: `🎯 选择节点生成 Mihomo (${nodeCount})`, callback_data: "select_nodes" }],
+    [{ text: `⚡ 全部节点生成 Mihomo (${nodeCount})`, callback_data: "export_node_collection" }],
     [{ text: "📦 管理节点合集", callback_data: "manage_nodes" }]
   ];
   if (backToList) inlineKeyboard.push([{ text: "⬅️ 返回保存列表", callback_data: "cancel" }]);
@@ -3010,10 +3187,10 @@ function parseCallbackAction(data: string): CallbackAction {
   if (data === "cancel") return { name: "cancel" };
 
   const [name, value] = data.split(":", 2);
-  if (["query_saved", "delete_saved", "confirm_delete_saved", "refresh_saved", "nodes_saved", "collapse_nodes_saved", "rename_saved", "replace_saved_source", "export_saved_mihomo", "reset_saved_mihomo", "monitor_item", "monitor_enable", "monitor_pause"].includes(name)) {
+  if (["query_saved", "delete_saved", "confirm_delete_saved", "refresh_saved", "nodes_saved", "collapse_nodes_saved", "rename_saved", "replace_saved_source", "export_saved_mihomo", "reset_saved_mihomo", "toggle_node", "monitor_item", "monitor_enable", "monitor_pause"].includes(name)) {
     return { name, subId: value && /^[a-f0-9]{12}$/i.test(value) ? value : undefined };
   }
-  if (["saved_page", "nodes_page", "monitor_page"].includes(name)) {
+  if (["saved_page", "nodes_page", "node_selection_page", "monitor_page"].includes(name)) {
     const page = Number(value);
     return { name, page: Number.isInteger(page) && page >= 0 ? page : 0 };
   }
@@ -3046,12 +3223,39 @@ async function createNodeCollectionShortLink(env: Env, userId: number): Promise<
   return shortId;
 }
 
+async function createSelectedNodeCollectionShortLink(env: Env, userId: number, nodeIds: string[]): Promise<string> {
+  const shortId = crypto.randomUUID().replace(/-/g, "").slice(0, 10);
+  const payload: ShortSubscription = {
+    kind: "node-selection",
+    nodeIds: [...new Set(nodeIds)],
+    format: "mihomo",
+    createdBy: userId,
+    createdAt: new Date().toISOString()
+  };
+  await env.SUB_KV.put(`short:${shortId}`, JSON.stringify(payload), { expirationTtl: SHORT_LINK_TTL_SECONDS });
+  return shortId;
+}
+
 function savedSubscriptionMihomoLinkKey(userId: number, subId: string): string {
   return `user:${userId}:saved-subscription-mihomo-link:${subId}`;
 }
 
 function pendingSavedSubscriptionSourceUpdateKey(userId: number): string {
   return `user:${userId}:pending-saved-subscription-source-update`;
+}
+
+function nodeSelectionKey(userId: number): string {
+  return `user:${userId}:node-selection`;
+}
+
+async function getNodeSelection(env: Env, userId: number): Promise<NodeSelectionState | null> {
+  const state = await env.SUB_KV.get<NodeSelectionState>(nodeSelectionKey(userId), "json");
+  return state && Array.isArray(state.selectedIds) && state.selectedIds.every((id) => typeof id === "string") ? state : null;
+}
+
+async function putNodeSelection(env: Env, userId: number, selectedIds: string[]): Promise<void> {
+  const state: NodeSelectionState = { selectedIds: [...new Set(selectedIds)] };
+  await env.SUB_KV.put(nodeSelectionKey(userId), JSON.stringify(state), { expirationTtl: NODE_SELECTION_TTL_SECONDS });
 }
 
 async function getOrCreateSavedSubscriptionMihomoLink(env: Env, userId: number, subId: string): Promise<string> {
@@ -3135,6 +3339,28 @@ async function exportShortLink(shortId: string, env: Env, userAgent: string): Pr
         "Profile-Update-Interval": "24"
       }
     });
+  }
+
+  if (short.kind === "node-selection") {
+    const selectedIds = new Set(short.nodeIds);
+    const uris = dedupeNodeUris(
+      savedNodeItems(await getSavedSubscriptions(env, short.createdBy))
+        .filter((item) => selectedIds.has(item.id))
+        .map((item) => item.url)
+    );
+    if (uris.length === 0) return new Response("Selected nodes are empty or removed", { status: 404 });
+    try {
+      const generated = generateClashNodeSubscription(uris);
+      return new Response(generateMihomoSubscription(generated.yaml), {
+        headers: {
+          "Content-Type": "text/yaml; charset=utf-8",
+          "Profile-Update-Interval": "24"
+        }
+      });
+    } catch (error) {
+      if (error instanceof MihomoExportError) return new Response(error.message, { status: 422 });
+      throw error;
+    }
   }
 
   if (short.kind === "node-collection") {
