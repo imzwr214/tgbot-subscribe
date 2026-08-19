@@ -200,6 +200,7 @@ const PREFERRED_UA = "clash-verge/v2.0.0";
 const KOIPY_SUBSCRIPTION_UA_MARKER = "Koipy-MiaoSpeed/";
 const AUTHORIZED_USERS_KEY = "authorized_users";
 const WEB_ADMIN_NAME = "imzwr";
+const PRIVATE_SUB_MENU_TEXT = "📦 我的订阅";
 const MONITOR_DAILY_REPORT_CRON = "0 1 * * *";
 
 export default {
@@ -815,7 +816,8 @@ async function handleTelegramUpdate(update: TelegramUpdate, request: Request, en
 
 async function handleMessage(message: TelegramMessage, request: Request, env: Env): Promise<void> {
   const userId = message.from?.id;
-  const text = (message.text ?? "").trim();
+  const rawText = (message.text ?? "").trim();
+  const text = message.chat.type === "private" && rawText === PRIVATE_SUB_MENU_TEXT ? "/sub" : rawText;
   const command = text.split(/\s+/)[0]?.replace(/@[A-Za-z0-9_]+$/, "") ?? "";
 
   if (command === "/whoami") {
@@ -865,6 +867,9 @@ async function handleMessage(message: TelegramMessage, request: Request, env: En
 
   if (command === "/start" || command === "/help") {
     await sendMessage(env, message.chat.id, helpTextV2(), mainKeyboardV2());
+    if (message.chat.type === "private") {
+      await sendMessage(env, message.chat.id, "底部快捷菜单已开启。", privateSubMenuKeyboard());
+    }
     return;
   }
 
@@ -2334,6 +2339,14 @@ function mainKeyboardV2() {
       [{ text: "查看已保存订阅", callback_data: "refresh" }],
       [{ text: "📡 机场稳定性监测", callback_data: "monitor_list" }]
     ]
+  };
+}
+
+function privateSubMenuKeyboard() {
+  return {
+    keyboard: [[{ text: PRIVATE_SUB_MENU_TEXT }]],
+    resize_keyboard: true,
+    is_persistent: true
   };
 }
 
