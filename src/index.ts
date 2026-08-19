@@ -1757,7 +1757,7 @@ async function resetSavedSubscriptionMihomo(subId: string, userId: number, callb
   await editCallbackMessage(
     env,
     callback,
-    `长期 Mihomo 订阅地址已重置：\n${origin}/m/${stableId}\n\n旧地址已失效。链接内含节点凭据，请勿公开分享。`,
+    `长期 Mihomo 订阅地址已重置：\n${origin}/m/${stableId}\n\n旧地址已撤销。链接内含节点凭据，请勿公开分享。`,
     savedSubscriptionKeyboard(subId, false)
   );
 }

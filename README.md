@@ -66,7 +66,7 @@ npx wrangler secret put MONITOR_TOKEN
 
 - 导出原始订阅不是 Clash YAML 转换，只是把订阅服务器返回的原始内容发成文件。
 - 机场 Mihomo 导出目前只支持包含 `proxies` 或 `proxy-providers` 的标准 Clash/Mihomo YAML；手动节点合集当前直接转换 VLESS，其他协议会明确提示并跳过。
-- 未保存订阅和节点合集生成的 Mihomo 链接有效期为 30 天；已保存机场可在详情页生成不会自动过期的长期 Mihomo 地址。长期地址会在机场接口临时失败时回退到最近一次成功快照；删除保存项或手动重置地址后，旧长期地址立即失效。
+- 未保存订阅和节点合集生成的 Mihomo 链接有效期为 30 天；已保存机场可在详情页生成不会自动过期的长期 Mihomo 地址。长期地址会在机场接口临时失败时回退到最近一次成功快照；删除保存项或手动重置地址后，旧长期地址会被撤销。
 - 已保存订阅默认显示本地快照，只在用户点击“手动刷新订阅”时请求上游；刷新失败不会覆盖旧快照。
 - 消息格式只对订阅链接使用 `code` entity，统计内容先不用 `blockquote` entity。
 - `subscription-userinfo` 里的 `reset_day` / `resetDay` 优先用于展示流量重置日；没有该字段时，如果响应头提供 `x-subscription-start-at` / `x-subscription-purchased-at` / `x-subscription-created-at` 和过期时间，会按 30 天周期显示“预计重置”，否则显示 `未知`。
