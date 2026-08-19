@@ -133,6 +133,13 @@ export async function listEnabledMonitorTargets(db: D1Database): Promise<Monitor
   return result.results.map((row) => ({ userId: row.user_id, subId: row.sub_id }));
 }
 
+export async function listEnabledMonitorUserIds(db: D1Database): Promise<string[]> {
+  const result = await db.prepare(
+    "SELECT DISTINCT user_id FROM monitor_targets WHERE enabled = 1 ORDER BY user_id ASC LIMIT 200"
+  ).all<{ user_id: string }>();
+  return result.results.map((row) => row.user_id);
+}
+
 export async function touchMonitorProbe(db: D1Database, probeId: string, label: string, version?: string): Promise<void> {
   await db.prepare(
     `INSERT INTO monitor_probes (probe_id, label, version, last_seen_at)

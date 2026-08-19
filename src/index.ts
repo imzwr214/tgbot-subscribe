@@ -4,6 +4,7 @@ import {
   deleteMonitorData,
   isMonitorTargetEnabled,
   listEnabledMonitorTargets,
+  listEnabledMonitorUserIds,
   listMonitorSummaries,
   MonitorReportInput,
   MonitorSummary,
@@ -199,6 +200,7 @@ const PREFERRED_UA = "clash-verge/v2.0.0";
 const KOIPY_SUBSCRIPTION_UA_MARKER = "Koipy-MiaoSpeed/";
 const AUTHORIZED_USERS_KEY = "authorized_users";
 const WEB_ADMIN_NAME = "imzwr";
+const MONITOR_DAILY_REPORT_CRON = "0 1 * * *";
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -299,7 +301,15 @@ export default {
     }
   },
 
-  async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
+  async scheduled(controller: ScheduledController, env: Env): Promise<void> {
+    if (controller.cron !== MONITOR_DAILY_REPORT_CRON) return;
+
+    try {
+      await sendDailyMonitorReports(env);
+    } catch (error) {
+      console.error("daily monitor reports failed", safeError(error));
+    }
+
     try {
       await cleanupMonitorHistory(env.MONITOR_DB);
     } catch (error) {
@@ -1231,7 +1241,7 @@ async function sendMonitorList(env: Env, chatId: number, userId: number, page = 
   await sendMessage(env, chatId, formatMonitorListText(subscriptions, summaries, page), monitorListKeyboard(subscriptions, summaries, page));
 }
 
-async function sendMonitorReport(env: Env, chatId: number, userId: number): Promise<void> {
+async function sendMonitorReport(env: Env, chatId: number, userId: number, title = "📊 机场稳定性报告"): Promise<void> {
   const [subscriptions, summaries] = await Promise.all([
     getSavedSubscriptions(env, userId),
     listMonitorSummaries(env.MONITOR_DB, userId)
@@ -1244,7 +1254,7 @@ async function sendMonitorReport(env: Env, chatId: number, userId: number): Prom
   }
 
   const header = [
-    "📊 机场稳定性报告",
+    title,
     "检测点：海创 VPS｜每10分钟一次",
     `生成时间：${formatIsoDateTime(new Date().toISOString())}`
   ].join("\n");
@@ -1261,6 +1271,23 @@ async function sendMonitorReport(env: Env, chatId: number, userId: number): Prom
     }
   }
   await sendMessage(env, chatId, message, keyboard);
+}
+
+async function sendDailyMonitorReports(env: Env): Promise<void> {
+  const userIds = await listEnabledMonitorUserIds(env.MONITOR_DB);
+  for (const userKey of userIds) {
+    const userId = Number(userKey);
+    if (!Number.isSafeInteger(userId) || userId <= 0) {
+      console.error("invalid monitor report user id");
+      continue;
+    }
+
+    try {
+      await sendMonitorReport(env, userId, userId, "📅 每日机场健康报告");
+    } catch (error) {
+      console.error("daily monitor report failed", safeError(error));
+    }
+  }
 }
 
 async function showMonitorList(callback: TelegramCallbackQuery, userId: number, env: Env, page = 0): Promise<void> {
