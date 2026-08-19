@@ -135,6 +135,12 @@ interface ShortLinkBase {
   createdAt: string;
 }
 
+interface PendingSavedSubscriptionSourceUpdate {
+  subId: string;
+  chatId: number;
+  promptMessageId: number;
+}
+
 type ShortSubscription =
   | (ShortLinkBase & {
       kind?: "subscription";
@@ -154,6 +160,11 @@ type ShortSubscription =
       kind: "node-collection";
       format: "mihomo";
       base64ShortId?: string;
+    })
+  | (ShortLinkBase & {
+      kind: "saved-subscription";
+      subId: string;
+      format: "mihomo";
     });
 
 interface TelegramMessageEntity {
@@ -202,6 +213,7 @@ const AUTHORIZED_USERS_KEY = "authorized_users";
 const WEB_ADMIN_NAME = "imzwr";
 const PRIVATE_SUB_MENU_TEXT = "📦 我的订阅";
 const MONITOR_DAILY_REPORT_CRON = "0 1 * * *";
+const PENDING_SAVED_SOURCE_UPDATE_TTL_SECONDS = 60 * 10;
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -509,6 +521,10 @@ async function webDeleteSavedSubscription(request: Request, env: Env): Promise<R
   const subscriptions = await getSavedSubscriptions(env, userId);
   const nextSubscriptions = subscriptions.filter((subscription) => subscription.id !== body.id);
   await putSavedSubscriptions(env, userId, nextSubscriptions);
+  const removed = subscriptions.find((subscription) => subscription.id === body.id);
+  if (removed && savedItemKind(removed) === "subscription") {
+    await revokeSavedSubscriptionMihomoLink(env, userId, body.id);
+  }
   try {
     await deleteMonitorData(env.MONITOR_DB, userId, body.id);
   } catch (error) {
@@ -834,6 +850,10 @@ async function handleMessage(message: TelegramMessage, request: Request, env: En
     return;
   }
 
+  if (await replaceSavedSubscriptionSourceFromReply(message, userId, env)) {
+    return;
+  }
+
   if (await renameSavedItemFromReply(message, userId, env)) {
     return;
   }
@@ -972,6 +992,21 @@ async function handleCallback(callback: TelegramCallbackQuery, request: Request,
 
   if (action.name === "rename_saved" && action.subId) {
     await promptRenameSavedItem(action.subId, userId, chatId, env);
+    return;
+  }
+
+  if (action.name === "replace_saved_source" && action.subId) {
+    await promptReplaceSavedSubscriptionSource(action.subId, userId, callback, env);
+    return;
+  }
+
+  if (action.name === "export_saved_mihomo" && action.subId) {
+    await exportSavedSubscriptionMihomo(action.subId, userId, callback, request, env);
+    return;
+  }
+
+  if (action.name === "reset_saved_mihomo" && action.subId) {
+    await resetSavedSubscriptionMihomo(action.subId, userId, callback, request, env);
     return;
   }
 
@@ -1131,7 +1166,7 @@ async function handleCallback(callback: TelegramCallbackQuery, request: Request,
       await editCallbackMessage(
         env,
         callback,
-        `Mihomo 配置与订阅链接已生成：\n${origin}/m/${shortId}`,
+        `Mihomo 配置与临时订阅链接已生成（30 天有效）：\n${origin}/m/${shortId}\n\n保存订阅后可生成不会自动过期的长期地址。`,
         actionKeyboard(false, action.cacheId)
       );
     } catch (error) {
@@ -1676,6 +1711,131 @@ async function refreshSavedSubscription(subId: string, userId: number, callback:
   }
 }
 
+async function exportSavedSubscriptionMihomo(subId: string, userId: number, callback: TelegramCallbackQuery, request: Request, env: Env): Promise<void> {
+  const subscriptions = await getSavedSubscriptions(env, userId);
+  const item = subscriptions.find((subscription) => subscription.id === subId);
+  if (!item || savedItemKind(item) !== "subscription") {
+    await editCallbackMessage(env, callback, formatSubscriptionListText(subscriptions), subscriptionListKeyboard(subscriptions));
+    return;
+  }
+
+  const snapshot = await getSavedSubscriptionSnapshot(env, userId, subId);
+  if (!snapshot || getUsableNodes(snapshot.nodes).length === 0) {
+    await editCallbackMessage(env, callback, "该订阅尚无可用本地快照。请先点击“手动刷新订阅”成功后再生成长期地址。", savedSubscriptionKeyboard(subId, false));
+    return;
+  }
+
+  try {
+    const body = generateMihomoSubscription(snapshot.raw);
+    const stableId = await getOrCreateSavedSubscriptionMihomoLink(env, userId, subId);
+    const origin = new URL(request.url).origin;
+    const link = `${origin}/m/${stableId}`;
+    const chatId = callback.message?.chat.id;
+    if (!chatId) return;
+    await sendTextDocument(env, chatId, mihomoSubscriptionFilename(snapshot), body, "长期 Mihomo 配置已生成");
+    await editCallbackMessage(
+      env,
+      callback,
+      `长期 Mihomo 订阅已生成：\n${link}\n\n此地址不会自动过期。机场更换订阅链接时，请用“更新订阅源地址”；如地址泄露，可用“重置长期订阅地址”。链接内含节点凭据，请勿公开分享。`,
+      savedSubscriptionKeyboard(subId, false)
+    );
+  } catch (error) {
+    await editCallbackMessage(env, callback, mihomoExportErrorMessage(error), savedSubscriptionKeyboard(subId, false));
+  }
+}
+
+async function resetSavedSubscriptionMihomo(subId: string, userId: number, callback: TelegramCallbackQuery, request: Request, env: Env): Promise<void> {
+  const subscriptions = await getSavedSubscriptions(env, userId);
+  const item = subscriptions.find((subscription) => subscription.id === subId);
+  if (!item || savedItemKind(item) !== "subscription") {
+    await editCallbackMessage(env, callback, formatSubscriptionListText(subscriptions), subscriptionListKeyboard(subscriptions));
+    return;
+  }
+
+  const stableId = await resetSavedSubscriptionMihomoLink(env, userId, subId);
+  const origin = new URL(request.url).origin;
+  await editCallbackMessage(
+    env,
+    callback,
+    `长期 Mihomo 订阅地址已重置：\n${origin}/m/${stableId}\n\n旧地址已失效。链接内含节点凭据，请勿公开分享。`,
+    savedSubscriptionKeyboard(subId, false)
+  );
+}
+
+async function promptReplaceSavedSubscriptionSource(subId: string, userId: number, callback: TelegramCallbackQuery, env: Env): Promise<void> {
+  const subscriptions = await getSavedSubscriptions(env, userId);
+  const item = subscriptions.find((subscription) => subscription.id === subId);
+  const chatId = callback.message?.chat.id;
+  if (!item || savedItemKind(item) !== "subscription" || !chatId) {
+    await editCallbackMessage(env, callback, formatSubscriptionListText(subscriptions), subscriptionListKeyboard(subscriptions));
+    return;
+  }
+
+  const prompt = await sendMessage(
+    env,
+    chatId,
+    "请回复这条消息，发送新的机场订阅链接。链接验证成功后，长期 Mihomo 地址保持不变。",
+    { force_reply: true, input_field_placeholder: "粘贴新的机场订阅链接" }
+  );
+  const promptMessageId = prompt.result?.message_id;
+  if (typeof promptMessageId === "number") {
+    const pending: PendingSavedSubscriptionSourceUpdate = { subId, chatId, promptMessageId };
+    await env.SUB_KV.put(pendingSavedSubscriptionSourceUpdateKey(userId), JSON.stringify(pending), { expirationTtl: PENDING_SAVED_SOURCE_UPDATE_TTL_SECONDS });
+  }
+  await editCallbackMessage(env, callback, `请回复我刚发送的消息，粘贴“${savedItemDisplayName(item)}”的新机场订阅链接。`, savedSubscriptionKeyboard(subId, false));
+}
+
+async function replaceSavedSubscriptionSourceFromReply(message: TelegramMessage, userId: number, env: Env): Promise<boolean> {
+  const pending = await env.SUB_KV.get<PendingSavedSubscriptionSourceUpdate>(pendingSavedSubscriptionSourceUpdateKey(userId), "json");
+  if (!pending || pending.chatId !== message.chat.id || pending.promptMessageId !== message.reply_to_message?.message_id) return false;
+
+  const input = extractQueryInput((message.text ?? "").trim());
+  if (!input || input.kind !== "subscription") {
+    await sendMessage(env, message.chat.id, "请回复有效的机场订阅链接。原地址和本地快照未改动。", undefined, message.message_id);
+    return true;
+  }
+
+  const subscriptions = await getSavedSubscriptions(env, userId);
+  const item = subscriptions.find((subscription) => subscription.id === pending.subId);
+  if (!item || savedItemKind(item) !== "subscription") {
+    await env.SUB_KV.delete(pendingSavedSubscriptionSourceUpdateKey(userId));
+    await sendMessage(env, message.chat.id, "保存订阅不存在或已经删除。", undefined, message.message_id);
+    return true;
+  }
+  if (subscriptions.some((subscription) => subscription.id !== item.id && subscription.url === input.url)) {
+    await sendMessage(env, message.chat.id, "这个订阅链接已经保存过了。原地址和本地快照未改动。", undefined, message.message_id);
+    return true;
+  }
+
+  try {
+    const result = await fetchAndParseSubscription(input.url, env);
+    if (getUsableNodes(result.nodes).length === 0) throw new Error("订阅未解析出可用节点");
+    const now = new Date().toISOString();
+    const cached: CachedSubscription = { url: input.url, updatedAt: now, ...result };
+    item.url = input.url;
+    item.name = savedSubscriptionName(cached);
+    item.airportName = cached.airportName;
+    item.updatedAt = now;
+    item.snapshotUpdatedAt = now;
+    item.snapshotNodeCount = getUsableNodes(cached.nodes).length;
+    item.lastRefreshAttemptAt = now;
+    item.lastRefreshError = undefined;
+    await putSavedSubscriptionSnapshot(env, userId, item.id, cached);
+    await putSavedSubscriptions(env, userId, subscriptions);
+    await env.SUB_KV.delete(pendingSavedSubscriptionSourceUpdateKey(userId));
+    await sendMessage(
+      env,
+      message.chat.id,
+      `订阅源地址已更新：${savedItemDisplayName(item)}\n长期 Mihomo 地址保持不变。`,
+      savedSubscriptionKeyboard(item.id, false),
+      message.message_id
+    );
+  } catch {
+    await sendMessage(env, message.chat.id, "新订阅链接验证失败。原地址和本地快照未改动；请确认链接有效后继续回复此消息重试。", undefined, message.message_id);
+  }
+  return true;
+}
+
 async function confirmDeleteSavedSubscription(subId: string, userId: number, callback: TelegramCallbackQuery, env: Env): Promise<void> {
   const subscriptions = await getSavedSubscriptions(env, userId);
   const item = subscriptions.find((subscription) => subscription.id === subId);
@@ -1704,6 +1864,7 @@ async function deleteSavedSubscriptionFromCallback(subId: string, userId: number
   const nextSubscriptions = subscriptions.filter((subscription) => subscription.id !== subId);
   await putSavedSubscriptions(env, userId, nextSubscriptions);
   if (savedItemKind(item) === "subscription") {
+    await revokeSavedSubscriptionMihomoLink(env, userId, subId);
     try {
       await deleteMonitorData(env.MONITOR_DB, userId, subId);
     } catch (error) {
@@ -2280,7 +2441,9 @@ function savedSubscriptionKeyboard(subId: string, nodesExpanded: boolean, cacheI
       ],
       [{ text: "📡 机场稳定性监测", callback_data: `monitor_item:${subId}` }],
       [{ text: "📄 导出原始订阅", callback_data: callback("export_yaml") }],
-      [{ text: "⚙️ Mihomo配置与订阅", callback_data: callback("export_mihomo") }],
+      [{ text: "⚙️ 生成长期 Mihomo 订阅", callback_data: `export_saved_mihomo:${subId}` }],
+      [{ text: "✏️ 更新订阅源地址", callback_data: `replace_saved_source:${subId}` }],
+      [{ text: "🔗 重置长期订阅地址", callback_data: `reset_saved_mihomo:${subId}` }],
       [{ text: "⬅️ 返回保存列表", callback_data: "cancel" }]
     ]
   };
@@ -2847,7 +3010,7 @@ function parseCallbackAction(data: string): CallbackAction {
   if (data === "cancel") return { name: "cancel" };
 
   const [name, value] = data.split(":", 2);
-  if (["query_saved", "delete_saved", "confirm_delete_saved", "refresh_saved", "nodes_saved", "collapse_nodes_saved", "rename_saved", "monitor_item", "monitor_enable", "monitor_pause"].includes(name)) {
+  if (["query_saved", "delete_saved", "confirm_delete_saved", "refresh_saved", "nodes_saved", "collapse_nodes_saved", "rename_saved", "replace_saved_source", "export_saved_mihomo", "reset_saved_mihomo", "monitor_item", "monitor_enable", "monitor_pause"].includes(name)) {
     return { name, subId: value && /^[a-f0-9]{12}$/i.test(value) ? value : undefined };
   }
   if (["saved_page", "nodes_page", "monitor_page"].includes(name)) {
@@ -2883,10 +3046,86 @@ async function createNodeCollectionShortLink(env: Env, userId: number): Promise<
   return shortId;
 }
 
+function savedSubscriptionMihomoLinkKey(userId: number, subId: string): string {
+  return `user:${userId}:saved-subscription-mihomo-link:${subId}`;
+}
+
+function pendingSavedSubscriptionSourceUpdateKey(userId: number): string {
+  return `user:${userId}:pending-saved-subscription-source-update`;
+}
+
+async function getOrCreateSavedSubscriptionMihomoLink(env: Env, userId: number, subId: string): Promise<string> {
+  const linkKey = savedSubscriptionMihomoLinkKey(userId, subId);
+  const existingId = await env.SUB_KV.get(linkKey);
+  if (existingId && /^[a-f0-9]{32}$/i.test(existingId)) {
+    const existing = await env.SUB_KV.get<ShortSubscription>(`short:${existingId}`, "json");
+    if (existing?.kind === "saved-subscription" && existing.createdBy === userId && existing.subId === subId && existing.format === "mihomo") {
+      return existingId;
+    }
+  }
+
+  const stableId = crypto.randomUUID().replace(/-/g, "");
+  const payload: ShortSubscription = {
+    kind: "saved-subscription",
+    subId,
+    format: "mihomo",
+    createdBy: userId,
+    createdAt: new Date().toISOString()
+  };
+  await env.SUB_KV.put(`short:${stableId}`, JSON.stringify(payload));
+  await env.SUB_KV.put(linkKey, stableId);
+  return stableId;
+}
+
+async function revokeSavedSubscriptionMihomoLink(env: Env, userId: number, subId: string): Promise<void> {
+  const linkKey = savedSubscriptionMihomoLinkKey(userId, subId);
+  const stableId = await env.SUB_KV.get(linkKey);
+  if (stableId && /^[a-f0-9]{32}$/i.test(stableId)) {
+    await env.SUB_KV.delete(`short:${stableId}`);
+  }
+  await env.SUB_KV.delete(linkKey);
+}
+
+async function resetSavedSubscriptionMihomoLink(env: Env, userId: number, subId: string): Promise<string> {
+  await revokeSavedSubscriptionMihomoLink(env, userId, subId);
+  return getOrCreateSavedSubscriptionMihomoLink(env, userId, subId);
+}
+
 async function exportShortLink(shortId: string, env: Env, userAgent: string): Promise<Response> {
-  if (!/^[a-z0-9]{10}$/i.test(shortId)) return new Response("Invalid short link", { status: 400 });
+  if (!/^(?:[a-z0-9]{10}|[a-f0-9]{32})$/i.test(shortId)) return new Response("Invalid short link", { status: 400 });
   const short = await env.SUB_KV.get<ShortSubscription>(`short:${shortId}`, "json");
   if (!short) return new Response("Short link not found or expired", { status: 404 });
+
+  if (short.kind === "saved-subscription") {
+    const subscriptions = await getSavedSubscriptions(env, short.createdBy);
+    const item = subscriptions.find((subscription) => subscription.id === short.subId && savedItemKind(subscription) === "subscription");
+    if (!item) return new Response("Saved subscription not found", { status: 404 });
+
+    let cached: CachedSubscription | null = null;
+    try {
+      const result = await fetchAndParseSubscription(item.url, env);
+      if (getUsableNodes(result.nodes).length === 0) throw new Error("subscription has no usable nodes");
+      cached = { ...result, url: item.url, updatedAt: new Date().toISOString() };
+    } catch {
+      const snapshot = await getSavedSubscriptionSnapshot(env, short.createdBy, item.id);
+      if (snapshot?.raw && getUsableNodes(snapshot.nodes).length > 0) {
+        cached = snapshot;
+      }
+    }
+    if (!cached) return new Response("Subscription upstream unavailable and no usable snapshot", { status: 502 });
+
+    try {
+      return new Response(generateMihomoSubscription(cached.raw), {
+        headers: {
+          "Content-Type": "text/yaml; charset=utf-8",
+          "Profile-Update-Interval": "24"
+        }
+      });
+    } catch (error) {
+      if (error instanceof MihomoExportError) return new Response(error.message, { status: 422 });
+      throw error;
+    }
+  }
 
   if (short.kind === "node") {
     if (!parseNodeLines([short.uri])[0]) return new Response("Invalid node link", { status: 422 });

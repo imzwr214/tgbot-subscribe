@@ -27,7 +27,7 @@ npx wrangler secret put MONITOR_TOKEN
 - `POST /telegram/webhook`: Telegram webhook 入口。
 - `GET /debug/subscription?token=xxx&user_id=123&url=...`: 校验 `DEBUG_TOKEN` 和白名单用户后调试订阅解析。
 - `GET /s/:id`: 仅用于兼容尚未过期的旧短链，不再生成新链接。
-- `GET /m/:id`: 返回可直接导入的 Mihomo 配置；节点合集变化后会动态更新。
+- `GET /m/:id`: 返回可直接导入的 Mihomo 配置；已保存机场的长期地址会跟随更新后的源地址，节点合集变化后也会动态更新。
 - `GET /health`: 健康检查。
 
 ## Telegram 用法
@@ -46,6 +46,7 @@ npx wrangler secret put MONITOR_TOKEN
 - 导出原始订阅
 - 生成 Mihomo 配置与订阅链接
 - 保存订阅
+- 为已保存机场生成不会自动过期的长期 Mihomo 地址、更新机场源地址、重置泄露的长期地址
 - 分页管理、重命名保存项
 - 清空节点合集（二次确认）
 - 按机场开启 / 暂停稳定性监测
@@ -65,7 +66,7 @@ npx wrangler secret put MONITOR_TOKEN
 
 - 导出原始订阅不是 Clash YAML 转换，只是把订阅服务器返回的原始内容发成文件。
 - 机场 Mihomo 导出目前只支持包含 `proxies` 或 `proxy-providers` 的标准 Clash/Mihomo YAML；手动节点合集当前直接转换 VLESS，其他协议会明确提示并跳过。
-- 新生成的 Mihomo 订阅链接有效期为 30 天，链接本身包含节点访问凭据，请勿公开分享。
+- 未保存订阅和节点合集生成的 Mihomo 链接有效期为 30 天；已保存机场可在详情页生成不会自动过期的长期 Mihomo 地址。长期地址会在机场接口临时失败时回退到最近一次成功快照；删除保存项或手动重置地址后，旧长期地址立即失效。
 - 已保存订阅默认显示本地快照，只在用户点击“手动刷新订阅”时请求上游；刷新失败不会覆盖旧快照。
 - 消息格式只对订阅链接使用 `code` entity，统计内容先不用 `blockquote` entity。
 - `subscription-userinfo` 里的 `reset_day` / `resetDay` 优先用于展示流量重置日；没有该字段时，如果响应头提供 `x-subscription-start-at` / `x-subscription-purchased-at` / `x-subscription-created-at` 和过期时间，会按 30 天周期显示“预计重置”，否则显示 `未知`。
