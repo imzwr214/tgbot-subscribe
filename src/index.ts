@@ -388,8 +388,8 @@ function botCommands(): Array<{ command: string; description: string }> {
     { command: "whoami", description: "查看自己的 Telegram user id" },
     { command: "query", description: "查询订阅或批量添加节点" },
     { command: "sub", description: "管理订阅与节点合集" },
-    { command: "monitor", description: "选择机场并管理稳定性监测" },
-    { command: "monitorreport", description: "查看已开启机场的稳定性汇总" },
+    { command: "monitor", description: "管理机场和自建节点稳定性" },
+    { command: "monitorreport", description: "查看已开启目标的稳定性汇总" },
     { command: "help", description: "查看帮助" }
   ];
 }
@@ -567,8 +567,18 @@ async function internalMonitorProvider(request: Request, env: Env, url: URL): Pr
 
   const numericUserId = Number(userId);
   const subscriptions = await getSavedSubscriptions(env, numericUserId);
-  const item = subscriptions.find((entry) => entry.id === subId && savedItemKind(entry) === "subscription");
+  const item = subscriptions.find((entry) => entry.id === subId);
   if (!item) return json({ ok: false, error: "target not found" }, 404);
+
+  if (savedItemKind(item) === "node") {
+    try {
+      const generated = generateClashNodeSubscription([item.url]);
+      return monitorProviderResponse(generated.yaml, true, "node");
+    } catch (error) {
+      console.error("monitor node provider unavailable", safeError(error));
+      return json({ ok: false, error: "node is not monitorable" }, 422);
+    }
+  }
 
   try {
     const result = await fetchAndParseSubscription(item.url, env);
@@ -607,10 +617,11 @@ async function internalMonitorReport(request: Request, env: Env): Promise<Respon
     try {
       const subscriptions = await getSavedSubscriptions(env, Number(alert.userId));
       const item = subscriptions.find((entry) => entry.id === alert.subId);
-      const name = item ? savedItemDisplayName(item) : "已删除的机场订阅";
+      const name = item ? savedItemDisplayName(item) : "已删除的监测目标";
+      const targetLabel = item && savedItemKind(item) === "node" ? "节点" : "机场";
       const text = alert.kind === "offline"
-        ? `🔴 机场掉线提醒\n${name}\n\n海创探针已连续两次未发现可用节点。\n检测时间：${formatIsoDateTime(new Date(alert.checkedAt).toISOString())}`
-        : `🟢 机场恢复提醒\n${name}\n\n海创探针已连续两次检测正常，当前在线 ${alert.onlineNodes}/${alert.totalNodes} 个节点。\n检测时间：${formatIsoDateTime(new Date(alert.checkedAt).toISOString())}`;
+        ? `🔴 ${targetLabel}掉线提醒\n${name}\n\n海创探针已连续两次未发现可用节点。\n检测时间：${formatIsoDateTime(new Date(alert.checkedAt).toISOString())}`
+        : `🟢 ${targetLabel}恢复提醒\n${name}\n\n海创探针已连续两次检测正常，当前在线 ${alert.onlineNodes}/${alert.totalNodes} 个节点。\n检测时间：${formatIsoDateTime(new Date(alert.checkedAt).toISOString())}`;
       await sendMessage(env, Number(alert.userId), text, { inline_keyboard: [[{ text: "查看监测详情", callback_data: `monitor_item:${alert.subId}` }]] });
     } catch (error) {
       console.error("failed to send monitor alert", safeError(error));
@@ -648,7 +659,7 @@ function authorizeMonitor(request: Request, env: Env): boolean {
   return request.headers.get("authorization") === `Bearer ${env.MONITOR_TOKEN}`;
 }
 
-function monitorProviderResponse(raw: string, fetchOk: boolean, sourceType: ParsedSubscription["sourceType"]): Response {
+function monitorProviderResponse(raw: string, fetchOk: boolean, sourceType: ParsedSubscription["sourceType"] | "node"): Response {
   return new Response(raw, {
     headers: {
       "Content-Type": "text/plain; charset=utf-8",
@@ -1416,7 +1427,7 @@ async function sendMonitorList(env: Env, chatId: number, userId: number, page = 
   await sendMessage(env, chatId, formatMonitorListText(subscriptions, summaries, page), monitorListKeyboard(subscriptions, summaries, page));
 }
 
-async function sendMonitorReport(env: Env, chatId: number, userId: number, title = "📊 机场稳定性报告"): Promise<void> {
+async function sendMonitorReport(env: Env, chatId: number, userId: number, title = "📊 节点稳定性报告"): Promise<void> {
   const [subscriptions, summaries] = await Promise.all([
     getSavedSubscriptions(env, userId),
     listMonitorSummaries(env.MONITOR_DB, userId)
@@ -1424,13 +1435,13 @@ async function sendMonitorReport(env: Env, chatId: number, userId: number, title
   const savedById = new Map(subscriptions.map((item) => [item.id, item]));
   const enabled = summaries.filter((summary) => summary.enabled);
   if (enabled.length === 0) {
-    await sendMessage(env, chatId, "还没有开启稳定性监测的机场。请先发送 /monitor 选择机场并开启监测。");
+    await sendMessage(env, chatId, "还没有开启稳定性监测的目标。请先发送 /monitor 选择机场或自建节点并开启监测。");
     return;
   }
 
   const header = [
     title,
-    "检测点：海创 VPS｜每10分钟一次",
+    "检测点：海创 VPS｜每10分钟一次真实连通测试",
     `生成时间：${formatIsoDateTime(new Date().toISOString())}`
   ].join("\n");
   const sections = enabled.map((summary) => formatMonitorReportSection(savedById.get(summary.subId), summary));
@@ -1458,7 +1469,7 @@ async function sendDailyMonitorReports(env: Env): Promise<void> {
     }
 
     try {
-      await sendMonitorReport(env, userId, userId, "📅 每日机场健康报告");
+      await sendMonitorReport(env, userId, userId, "📅 每日节点健康报告");
     } catch (error) {
       console.error("daily monitor report failed", safeError(error));
     }
@@ -1478,9 +1489,9 @@ async function showMonitorTarget(subId: string, callback: TelegramCallbackQuery,
     getSavedSubscriptions(env, userId),
     listMonitorSummaries(env.MONITOR_DB, userId)
   ]);
-  const item = subscriptions.find((entry) => entry.id === subId && savedItemKind(entry) === "subscription");
+  const item = subscriptions.find((entry) => entry.id === subId);
   if (!item) {
-    await editCallbackMessage(env, callback, "机场订阅不存在或已经删除。", monitorListKeyboard(subscriptions, summaries));
+    await editCallbackMessage(env, callback, "监测目标不存在或已经删除。", monitorListKeyboard(subscriptions, summaries));
     return;
   }
   const summary = summaries.find((entry) => entry.subId === subId);
@@ -1495,9 +1506,9 @@ async function updateMonitorTarget(
   env: Env
 ): Promise<void> {
   const subscriptions = await getSavedSubscriptions(env, userId);
-  const item = subscriptions.find((entry) => entry.id === subId && savedItemKind(entry) === "subscription");
+  const item = subscriptions.find((entry) => entry.id === subId);
   if (!item) {
-    await editCallbackMessage(env, callback, "机场订阅不存在或已经删除。", { inline_keyboard: [[{ text: "⬅️ 返回监测列表", callback_data: "monitor_back" }]] });
+    await editCallbackMessage(env, callback, "监测目标不存在或已经删除。", { inline_keyboard: [[{ text: "⬅️ 返回监测列表", callback_data: "monitor_back" }]] });
     return;
   }
   await setMonitorEnabled(env.MONITOR_DB, userId, subId, enabled);
@@ -1508,29 +1519,29 @@ async function updateMonitorTarget(
 }
 
 function formatMonitorListText(subscriptions: SavedSubscriptionItem[], summaries: MonitorSummary[], requestedPage = 0): string {
-  const page = savedItemsPage(subscriptions, "subscription", requestedPage);
-  if (page.total === 0) return "还没有保存的机场订阅。请先查询并保存订阅，再开启稳定性监测。";
+  const page = savedItemsPage(subscriptions, "all", requestedPage);
+  if (page.total === 0) return "还没有保存的机场订阅或自建节点。请先发送链接并保存，再开启稳定性监测。";
   const summaryById = new Map(summaries.map((summary) => [summary.subId, summary]));
   const lines = [
-    "📡 机场稳定性监测",
-    "检测点：海创 VPS｜每10分钟一次",
-    "请选择一个机场开启、暂停或查看监测。",
+    "📡 节点稳定性监测",
+    "检测点：海创 VPS｜每10分钟一次真实连通测试",
+    "可选择机场订阅或节点合集里的自建节点。",
     "",
-    `机场：${page.total} 个（第 ${page.page + 1}/${page.totalPages} 页）`
+    `目标：${page.total} 个（第 ${page.page + 1}/${page.totalPages} 页）`
   ];
   for (const [index, item] of page.items.entries()) {
     const summary = summaryById.get(item.id);
-    lines.push(`${page.page * SAVED_PAGE_SIZE + index + 1}. ${monitorStatusIcon(summary)} ${savedItemDisplayName(item)} — ${monitorListStatus(summary)}`);
+    lines.push(`${page.page * SAVED_PAGE_SIZE + index + 1}. ${monitorStatusIcon(summary)} ${monitorTargetKindLabel(item)} ${savedItemDisplayName(item)} — ${monitorListStatus(summary)}`);
   }
   return lines.join("\n");
 }
 
 function monitorListKeyboard(subscriptions: SavedSubscriptionItem[], summaries: MonitorSummary[], requestedPage = 0) {
-  const page = savedItemsPage(subscriptions, "subscription", requestedPage);
+  const page = savedItemsPage(subscriptions, "all", requestedPage);
   if (page.total === 0) return { inline_keyboard: [[{ text: "⬅️ 返回保存列表", callback_data: "cancel" }]] };
   const summaryById = new Map(summaries.map((summary) => [summary.subId, summary]));
   const rows: Array<Array<{ text: string; callback_data: string }>> = page.items.map((item) => [{
-    text: `${monitorStatusIcon(summaryById.get(item.id))} ${savedItemDisplayName(item).slice(0, 30)}`,
+    text: `${monitorStatusIcon(summaryById.get(item.id))} ${monitorTargetKindLabel(item)} ${savedItemDisplayName(item).slice(0, 26)}`,
     callback_data: `monitor_item:${item.id}`
   }]);
   const pagination = paginationRow("monitor_page", page.page, page.totalPages);
@@ -1540,9 +1551,10 @@ function monitorListKeyboard(subscriptions: SavedSubscriptionItem[], summaries: 
 }
 
 function formatMonitorTargetText(item: SavedSubscriptionItem, summary?: MonitorSummary): string {
-  const lines = [`📡 ${savedItemDisplayName(item)}`, "检测点：海创 VPS"];
+  const kindLabel = monitorTargetKindLabel(item);
+  const lines = [`📡 ${kindLabel}：${savedItemDisplayName(item)}`, "检测点：海创 VPS"];
   if (!summary?.enabled) {
-    lines.push("", "状态：⚪ 尚未开启监测", "开启后每10分钟执行一次真实节点连通测试。", "不会进行下载测速，也不会覆盖手动保存的订阅快照。");
+    lines.push("", "状态：⚪ 尚未开启监测", "开启后每10分钟执行一次真实节点连通测试。", savedItemKind(item) === "node" ? "不会进行下载测速，节点凭据不会写入 D1。" : "不会进行下载测速，也不会覆盖手动保存的订阅快照。");
     return lines.join("\n");
   }
 
@@ -1563,7 +1575,7 @@ function formatMonitorTargetText(item: SavedSubscriptionItem, summary?: MonitorS
     `30天节点在线率：${formatMonitorRate(summary.rate30d)}`,
     `24小时监测覆盖：${formatMonitorCoverage(summary, 24 * 60 * 60 * 1000, summary.samples24h)}`
   );
-  if (summary.subscriptionFetchOk !== null && !summary.stale) {
+  if (savedItemKind(item) === "subscription" && summary.subscriptionFetchOk !== null && !summary.stale) {
     lines.push(`订阅接口：${summary.subscriptionFetchOk ? "正常" : "异常，已使用上次成功快照测试"}`);
   }
   lines.push(`最后检测：${summary.lastCheckedAt ? formatIsoDateTime(new Date(summary.lastCheckedAt).toISOString()) : "等待首轮检测"}`);
@@ -1572,7 +1584,7 @@ function formatMonitorTargetText(item: SavedSubscriptionItem, summary?: MonitorS
 }
 
 function formatMonitorReportSection(item: SavedSubscriptionItem | undefined, summary: MonitorSummary): string {
-  const name = item ? savedItemDisplayName(item) : "已删除的机场订阅";
+  const name = item ? `${monitorTargetKindLabel(item)}：${savedItemDisplayName(item)}` : "已删除的监测目标";
   const status = effectiveMonitorStatus(summary);
   const lines = [`${monitorStatusIcon(summary)} ${name}`, `状态：${monitorStatusLabel(status)}`];
   if (summary.totalNodes !== null && summary.onlineNodes !== null && !summary.stale) {
@@ -1632,6 +1644,10 @@ function monitorListStatus(summary?: MonitorSummary): string {
   return `${summary.onlineNodes}/${summary.totalNodes} 在线`;
 }
 
+function monitorTargetKindLabel(item: SavedSubscriptionItem): string {
+  return savedItemKind(item) === "node" ? "自建节点" : "机场";
+}
+
 function formatMonitorRate(value: number | null): string {
   return value === null ? "样本不足" : `${value.toFixed(1)}%`;
 }
@@ -1652,6 +1668,7 @@ function monitorErrorText(code: string): string {
     provider_parse_failed: "Mihomo 无法解析订阅格式",
     probe_failed: "探针执行失败"
   };
+  if (code === "provider_http_422") return "节点配置暂不支持监测";
   if (/^provider_http_\d{3}$/.test(code)) return "订阅获取失败";
   return messages[code] ?? "探针暂时异常";
 }
@@ -1727,6 +1744,7 @@ function nodeCollectionListKeyboard(subscriptions: SavedSubscriptionItem[], requ
   const rows: Array<Array<{ text: string; callback_data: string }>> = [
     [{ text: `🎯 选择节点生成 Mihomo (${page.total})`, callback_data: "select_nodes" }],
     [{ text: `⚡ 全部节点生成 Mihomo (${page.total})`, callback_data: "export_node_collection" }],
+    [{ text: "📡 节点稳定性监测", callback_data: "monitor_list" }],
     ...page.items.map((item) => [
       { text: savedItemButtonText(item), callback_data: `query_saved:${item.id}` },
       { text: "✏️", callback_data: `rename_saved:${item.id}` },
@@ -1779,9 +1797,9 @@ function nodeSelectionKeyboard(page: NodeSelectionPage, selectedIds: Set<string>
   return { inline_keyboard: rows };
 }
 
-function savedItemsPage(subscriptions: SavedSubscriptionItem[], kind: "subscription" | "node", requestedPage = 0) {
+function savedItemsPage(subscriptions: SavedSubscriptionItem[], kind: "subscription" | "node" | "all", requestedPage = 0) {
   const items = subscriptions
-    .filter((item) => savedItemKind(item) === kind)
+    .filter((item) => kind === "all" || savedItemKind(item) === kind)
     .sort((left, right) => (right.lastQueryAt ?? right.updatedAt).localeCompare(left.lastQueryAt ?? left.updatedAt));
   const totalPages = Math.max(1, Math.ceil(items.length / SAVED_PAGE_SIZE));
   const page = Math.min(Math.max(0, requestedPage), totalPages - 1);
@@ -2040,11 +2058,11 @@ async function deleteSavedSubscriptionFromCallback(subId: string, userId: number
   await putSavedSubscriptions(env, userId, nextSubscriptions);
   if (savedItemKind(item) === "subscription") {
     await revokeSavedSubscriptionMihomoLink(env, userId, subId);
-    try {
-      await deleteMonitorData(env.MONITOR_DB, userId, subId);
-    } catch (error) {
-      console.error("failed to delete monitor data", safeError(error));
-    }
+  }
+  try {
+    await deleteMonitorData(env.MONITOR_DB, userId, subId);
+  } catch (error) {
+    console.error("failed to delete monitor data", safeError(error));
   }
   await editCallbackMessage(env, callback, `已删除：${savedItemDisplayName(item)}\n\n${formatSubscriptionListText(nextSubscriptions)}`, subscriptionListKeyboard(nextSubscriptions));
 }
@@ -2111,8 +2129,14 @@ async function confirmClearNodeCollection(userId: number, callback: TelegramCall
 async function clearNodeCollection(userId: number, callback: TelegramCallbackQuery, env: Env): Promise<void> {
   const subscriptions = await getSavedSubscriptions(env, userId);
   const nextSubscriptions = subscriptions.filter((item) => savedItemKind(item) === "subscription");
+  const removedNodeIds = subscriptions.filter((item) => savedItemKind(item) === "node").map((item) => item.id);
   const removed = subscriptions.length - nextSubscriptions.length;
   await putSavedSubscriptions(env, userId, nextSubscriptions);
+  try {
+    await Promise.all(removedNodeIds.map((subId) => deleteMonitorData(env.MONITOR_DB, userId, subId)));
+  } catch (error) {
+    console.error("failed to delete node monitor data", safeError(error));
+  }
   await editCallbackMessage(
     env,
     callback,
@@ -2631,6 +2655,7 @@ function nodeActionKeyboard(cacheId?: string, backToList = false, savedNodeId?: 
   } else if (savedNodeId) {
     inlineKeyboard.push([{ text: "🎯 选择节点生成 Mihomo", callback_data: "select_nodes" }]);
     inlineKeyboard.push([{ text: "⚡ 全部节点生成 Mihomo", callback_data: "export_node_collection" }]);
+    inlineKeyboard.push([{ text: "📡 节点稳定性监测", callback_data: `monitor_item:${savedNodeId}` }]);
     inlineKeyboard.push([{ text: "✏️ 重命名", callback_data: `rename_saved:${savedNodeId}` }]);
   }
   if (backToList) {
@@ -2651,6 +2676,7 @@ function nodeCollectionKeyboard(nodeCount: number, backToList = false) {
   const inlineKeyboard = [
     [{ text: `🎯 选择节点生成 Mihomo (${nodeCount})`, callback_data: "select_nodes" }],
     [{ text: `⚡ 全部节点生成 Mihomo (${nodeCount})`, callback_data: "export_node_collection" }],
+    [{ text: "📡 节点稳定性监测", callback_data: "monitor_list" }],
     [{ text: "📦 管理节点合集", callback_data: "manage_nodes" }]
   ];
   if (backToList) inlineKeyboard.push([{ text: "⬅️ 返回保存列表", callback_data: "cancel" }]);
@@ -2677,7 +2703,7 @@ function mainKeyboardV2() {
   return {
     inline_keyboard: [
       [{ text: "查看已保存订阅", callback_data: "refresh" }],
-      [{ text: "📡 机场稳定性监测", callback_data: "monitor_list" }]
+      [{ text: "📡 节点稳定性监测", callback_data: "monitor_list" }]
     ]
   };
 }
@@ -2699,8 +2725,8 @@ function helpTextV2(): string {
     "/whoami 查看自己的 Telegram user id",
     "/query <订阅或节点链接> 群聊里查询",
     "/sub 管理订阅与节点合集",
-    "/monitor 选择机场并管理稳定性监测",
-    "/monitorreport 查看已开启机场的稳定性汇总",
+    "/monitor 管理机场和自建节点稳定性",
+    "/monitorreport 查看已开启目标的稳定性汇总",
     "/users 管理员查看授权用户",
     "/allow <userId> 管理员授权用户",
     "/revoke <userId> 管理员取消授权用户",
