@@ -1073,7 +1073,7 @@ async function handleCallback(callback: TelegramCallbackQuery, request: Request,
   }
 
   if (action.name === "save_node") {
-    const cachedNode = await getCachedNode(env, userId, action.cacheId);
+    const cachedNode = await getCachedNodeForSave(env, userId, action.cacheId, callback.message);
     if (!cachedNode) {
       await sendMessage(env, chatId, "节点缓存已过期，请重新发送节点链接。");
       return;
@@ -1090,7 +1090,7 @@ async function handleCallback(callback: TelegramCallbackQuery, request: Request,
   }
 
   if (action.name === "save_nodes") {
-    const cachedBundle = await getCachedNodeBundle(env, userId, action.cacheId);
+    const cachedBundle = await getCachedNodeBundleForSave(env, userId, action.cacheId);
     if (!cachedBundle) {
       await sendMessage(env, chatId, "节点批量缓存已过期，请重新发送节点链接。");
       return;
@@ -1345,20 +1345,14 @@ async function queryAndSend(subUrl: string, userId: number, chatId: number, env:
 }
 
 async function sendNodeResult(uri: string, userId: number, chatId: number, env: Env, replyToMessageId?: number): Promise<void> {
-  const node = parseNodeLines([uri])[0];
-  if (!node) {
+  const cached = createCachedNode(uri);
+  if (!cached) {
     await sendFormattedMessage(env, chatId, formatSingleNodeMessage(uri), undefined, replyToMessageId);
     return;
   }
 
   const cacheId = createCacheId();
-  await cacheNode(env, userId, {
-    uri,
-    name: node.name,
-    protocol: node.protocol,
-    region: node.region,
-    updatedAt: new Date().toISOString()
-  }, cacheId);
+  await cacheNode(env, userId, cached, cacheId);
   await sendFormattedMessage(env, chatId, formatSingleNodeMessage(uri), nodeActionKeyboard(cacheId), replyToMessageId);
 }
 
@@ -2659,7 +2653,10 @@ function nodeActionKeyboard(cacheId?: string, backToList = false, savedNodeId?: 
     inlineKeyboard.push([{ text: "✏️ 重命名", callback_data: `rename_saved:${savedNodeId}` }]);
   }
   if (backToList) {
-    inlineKeyboard.push([{ text: "↩️ 返回保存列表", callback_data: "cancel" }]);
+    inlineKeyboard.push([savedNodeId
+      ? { text: "↩️ 返回节点合集", callback_data: "manage_nodes" }
+      : { text: "↩️ 返回保存列表", callback_data: "cancel" }
+    ]);
   }
   return {
     inline_keyboard: inlineKeyboard
@@ -3188,8 +3185,17 @@ async function getCachedNode(env: Env, userId: number, cacheId?: string): Promis
   return env.SUB_KV.get(`cache:node:${userId}:${cacheId}`, "json");
 }
 
+async function getCachedNodeForSave(env: Env, userId: number, cacheId: string | undefined, message?: TelegramMessage): Promise<CachedNode | null> {
+  const cached = await getCachedNode(env, userId, cacheId);
+  if (cached) return cached;
+  if (!cacheId) return cachedNodeFromMessage(message);
+  const durable = await env.SUB_KV.get<CachedNode>(`cache-node-save:${userId}:${cacheId}`, "json");
+  return durable ?? cachedNodeFromMessage(message);
+}
+
 async function cacheNode(env: Env, userId: number, cached: CachedNode, cacheId: string): Promise<void> {
   await env.SUB_KV.put(`cache:node:${userId}:${cacheId}`, JSON.stringify(cached), { expirationTtl: CACHE_TTL_SECONDS });
+  await env.SUB_KV.put(`cache-node-save:${userId}:${cacheId}`, JSON.stringify(cached));
 }
 
 async function getCachedNodeBundle(env: Env, userId: number, cacheId?: string): Promise<CachedNodeBundle | null> {
@@ -3197,8 +3203,35 @@ async function getCachedNodeBundle(env: Env, userId: number, cacheId?: string): 
   return env.SUB_KV.get(`cache:nodes:${userId}:${cacheId}`, "json");
 }
 
+async function getCachedNodeBundleForSave(env: Env, userId: number, cacheId?: string): Promise<CachedNodeBundle | null> {
+  const cached = await getCachedNodeBundle(env, userId, cacheId);
+  if (cached || !cacheId) return cached;
+  return env.SUB_KV.get(`cache-nodes-save:${userId}:${cacheId}`, "json");
+}
+
 async function cacheNodeBundle(env: Env, userId: number, cached: CachedNodeBundle, cacheId: string): Promise<void> {
   await env.SUB_KV.put(`cache:nodes:${userId}:${cacheId}`, JSON.stringify(cached), { expirationTtl: CACHE_TTL_SECONDS });
+  await env.SUB_KV.put(`cache-nodes-save:${userId}:${cacheId}`, JSON.stringify(cached));
+}
+
+function createCachedNode(uri: string): CachedNode | null {
+  const node = parseNodeLines([uri])[0];
+  if (!node) return null;
+  return {
+    uri,
+    name: node.name,
+    protocol: node.protocol,
+    region: node.region,
+    updatedAt: new Date().toISOString()
+  };
+}
+
+function cachedNodeFromMessage(message?: TelegramMessage): CachedNode | null {
+  const uri = message?.text
+    ?.split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => /^[a-z0-9+.-]+:\/\/\S+$/i.test(line));
+  return uri ? createCachedNode(uri) : null;
 }
 
 function createCacheId(): string {
