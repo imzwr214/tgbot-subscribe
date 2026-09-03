@@ -1164,13 +1164,22 @@ async function handleCallback(callback: TelegramCallbackQuery, request: Request,
     return;
   }
 
-  const cached = await getCachedSubscription(env, userId, action.cacheId);
+  let cached = await getCachedSubscription(env, userId, action.cacheId);
+  const cachedUrl = await getCachedSubscriptionUrl(env, userId, action.cacheId);
+  if (!cached && cachedUrl && !["refresh", "nodes", "collapse_nodes"].includes(action.name)) {
+    try {
+      const result = await fetchAndParseSubscription(cachedUrl, env);
+      cached = { url: cachedUrl, updatedAt: new Date().toISOString(), ...result };
+      await cacheSubscription(env, userId, cached, action.cacheId);
+    } catch (error) {
+      await sendMessage(env, chatId, `订阅缓存已过期，重新获取订阅失败：${safeError(error)}`);
+      return;
+    }
+  }
   if (!cached && !["refresh", "nodes", "collapse_nodes"].includes(action.name)) {
     await sendMessage(env, chatId, "缓存已过期，请重新发送订阅链接或使用 /sub。");
     return;
   }
-
-  const cachedUrl = await getCachedSubscriptionUrl(env, userId, action.cacheId);
 
   if (action.name === "refresh") {
     const saved = await getSavedSubscriptions(env, userId);
@@ -1249,7 +1258,7 @@ async function startNodeSelection(userId: number, callback: TelegramCallbackQuer
     await editCallbackMessage(env, callback, "节点合集还是空的，请先发送节点链接并加入合集。", nodeCollectionListKeyboard([]));
     return;
   }
-  await putNodeSelection(env, userId, items.map((item) => item.id));
+  await putNodeSelection(env, userId, []);
   await showNodeSelection(userId, callback, env, 0);
 }
 
@@ -1286,7 +1295,7 @@ async function showNodeSelection(userId: number, callback: TelegramCallbackQuery
   }
   const selectedIds = new Set(state.selectedIds.filter((id) => items.some((item) => item.id === id)));
   const page = nodeSelectionPage(items, requestedPage);
-  const lines = [`选择要生成订阅的节点：已选 ${selectedIds.size}/${items.length} 个（第 ${page.page + 1}/${page.totalPages} 页）`, "点击节点可勾选或取消；选择状态保留 30 分钟。"];
+  const lines = [`选择要生成订阅的节点：已选 ${selectedIds.size}/${items.length} 个（第 ${page.page + 1}/${page.totalPages} 页）`, "默认未选择节点；点击节点可勾选或取消，选择状态保留 30 分钟。"];
   for (const item of page.items) {
     const protocol = parseNodeLines([item.url])[0]?.protocol ?? "未知";
     lines.push(`${selectedIds.has(item.id) ? "✅" : "⬜"} ${savedItemDisplayName(item)}（${protocol}）`);
